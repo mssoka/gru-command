@@ -17,7 +17,8 @@ import { afterAll, describe, expect, it, onTestFinished } from 'vitest';
 import { WebSocket } from 'ws';
 import * as web from '../web/src/lib/protocol.js';
 import { ChatFrameLog } from '../src/chat/frame-log.js';
-import { createChatServer, type ChatServer } from '../src/chat/server.js';
+import { createChatServer, type ChatServer, type ChatServerOptions } from '../src/chat/server.js';
+import { SupervisedSlotStoppedError } from '../src/supervision/supervisor.js';
 import { AWARENESS_WAKE_INSTRUCTION, type AwarenessInjection, type GruAwarenessPort } from '../src/chat/awareness.js';
 import { GruSessionPointer, SESSION_STATE_NAME } from '../src/chat/session-state.js';
 import { CorruptSessionTreeError } from '../src/runtime/session-tree.js';
@@ -310,6 +311,8 @@ async function makeHarness(options: {
   readonly replaceDisposedOnResume?: boolean;
   readonly canAdoptFreshGru?: () => boolean;
   readonly adoptFreshGru?: (handle: AgentHandle) => Promise<void>;
+  readonly canWakeGru?: () => boolean;
+  readonly gruStop?: ChatServerOptions['gruStop'];
   readonly siblingUpgradePaths?: readonly string[];
   readonly awareness?: GruAwarenessPort;
   /** Spawn-retry gate overrides: 0 disables the gate (default here so the
@@ -439,6 +442,8 @@ async function makeHarness(options: {
     ...(options.adoptFreshGru !== undefined
       ? { adoptFreshGru: options.adoptFreshGru }
       : {}),
+    ...(options.canWakeGru !== undefined ? { canWakeGru: options.canWakeGru } : {}),
+    ...(options.gruStop !== undefined ? { gruStop: options.gruStop } : {}),
     ...(options.awareness !== undefined ? { awareness: options.awareness } : {}),
     authDeadlineMs: options.authDeadlineMs,
     heartbeatMs: options.heartbeatMs ?? 0, // off by default; the heartbeat test opts in
@@ -1263,6 +1268,100 @@ describe('chat server (real sockets, stub Gru)', () => {
     expect(harness.spawnCalls).toEqual([null, null]); // fresh brain both times
     await retry.close();
     await harness.close();
+  });
+
+  it('a stopped Gru (#619): the warmup names the stop and its alert once and spawns nothing', async () => {
+    let stop: ReturnType<NonNullable<ChatServerOptions['gruStop']>> =
+      { agentId: 'gru-wall', stopReason: 'authentication_wall', notificationId: 'alert-619' };
+    const harness = await makeHarness({ canWakeGru: () => false, gruStop: () => stop });
+    try {
+      harness.chat.warmup();
+      await pollUntil(() => harness.frameLog.history.some((frame) => frame.type === 'notice'), 'stop notice');
+      harness.chat.warmup();
+      await new Promise((resolveTick) => setTimeout(resolveTick, 20));
+      const notices = () => harness.frameLog.history.filter((frame) => frame.type === 'notice');
+      expect(notices()).toHaveLength(1);
+      expect(notices()[0]).toMatchObject({
+        text:
+          'Gru is stopped (authentication wall; alert alert-619) and will not restart on its own. ' +
+          'Send Gru a message to re-arm it.',
+      });
+      expect(harness.frameLog.history.some((frame) => frame.type === 'error')).toBe(false);
+      expect(harness.spawnCalls).toEqual([]);
+      // Another stop, with no cause or alert recorded: its own notice, which
+      // names neither.
+      stop = { agentId: 'gru-other', stopReason: null, notificationId: null };
+      harness.chat.warmup();
+      await pollUntil(() => notices().length === 2, 'second stop notice');
+      expect(notices()[1]).toMatchObject({
+        text: 'Gru is stopped and will not restart on its own. Send Gru a message to re-arm it.',
+      });
+    } finally {
+      await harness.close();
+    }
+  });
+
+  it('a stopped Gru (#619): a refused wake spawn is not a spawn failure, so the re-arming chat message is not backed off', async () => {
+    const harness = await makeHarness({
+      failFirstSpawn: new SupervisedSlotStoppedError({
+        slotId: 'gru-main',
+        agentId: 'gru-legacy',
+        stopReason: 'authentication_wall',
+        notificationId: 'alert-legacy',
+        by: 'autonomous ensure',
+      }),
+      // A tripped gate would turn the chat message below away for a minute.
+      spawnBackoffBaseMs: 60_000,
+      spawnBackoffMaxMs: 60_000,
+    });
+    try {
+      harness.chat.warmup();
+      await pollUntil(() => harness.frameLog.history.some((frame) => frame.type === 'notice'), 'stop notice');
+      expect(harness.frameLog.history.find((frame) => frame.type === 'notice')).toMatchObject({
+        text: expect.stringContaining('Gru is stopped (authentication wall; alert alert-legacy)'),
+      });
+      expect(harness.frameLog.history.some((frame) => frame.type === 'error')).toBe(false);
+      // The supervisor re-arms on the chat message's user-intent ensure.
+      const client = await authedClient(harness.port);
+      const done = nextTurnEnd(client);
+      client.send('are you back?', 'm-619');
+      await done;
+      expect(harness.handle.calls).toEqual([{ op: 'prompt', text: 'are you back?', owner: 'chat' }]);
+      expect(harness.spawnCalls).toEqual([null, null]);
+      await client.close();
+    } finally {
+      await harness.close();
+    }
+  });
+
+  it('a stopped Gru (#619): a spawn failure that is not a stop refusal still backs off and says why', async () => {
+    const harness = await makeHarness({
+      failFirstSpawn: new Error('model unavailable'),
+      gruStop: () => ({ agentId: 'gru-wall', stopReason: 'authentication_wall', notificationId: 'alert-619' }),
+      spawnBackoffBaseMs: 60_000,
+      spawnBackoffMaxMs: 60_000,
+    });
+    try {
+      const client = await authedClient(harness.port);
+      client.send('wake the brain', 'm-plain');
+      await client.waitFor(
+        (frame) => frame.type === 'error' && /Gru could not start: model unavailable/.test(frame.message),
+        'spawn failure surfaced',
+      );
+      expect(await client.closed).toBe(1011);
+      expect(harness.frameLog.history.some((frame) => frame.type === 'notice')).toBe(false);
+      // The gate is armed: a reconnect inside the window is not retried.
+      const retry = await authedClient(harness.port);
+      retry.send('wake the brain', 'm-plain');
+      await retry.waitFor(
+        (frame) => frame.type === 'error' && /temporarily unavailable/.test(frame.message),
+        'backoff fast-fail',
+      );
+      expect(harness.spawnCalls).toEqual([null]);
+      await retry.close();
+    } finally {
+      await harness.close();
+    }
   });
 
   it('a persistently broken spawn backs off: a reconnect within the window does not retry it', async () => {

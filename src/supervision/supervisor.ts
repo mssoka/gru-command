@@ -430,6 +430,9 @@ export interface SupervisedSlot {
   /** Whether an intentional replacement may commit now. An open breaker
    * fails closed: chat must not install a handle the watchdog will ignore. */
   canReplace(): boolean;
+  /** The slot's stop (its stopped record, or a stop restored from the
+   * previous process that names the slot); null when it is not stopped. */
+  stop(): SupervisedSlotStop | null;
   /** Intentionally make an already-spawned fresh handle current. This
    * advances the slot generation so an older restart cannot swap back in. */
   adoptReplacement(handle: AgentHandle): Promise<void>;
@@ -505,6 +508,43 @@ export interface SupervisorOptions {
 export type SupervisorRestartPolicy =
   | { readonly options: SpawnOptions }
   | { readonly refuse: string };
+
+/** Gru cannot dispose an alert about its own stop (#619): the alert names
+ * the owner's way out instead. */
+const GRU_SELF_STOP_HINT = (role: Role): string =>
+  role === 'gru' ? ' Gru is the stopped agent here: a chat message to Gru re-arms it.' : '';
+
+/** A slot's stop as its owner surfaces it (#619): the stopped agent, why it
+ * stopped, and the alert whose disposition re-arms it. */
+export interface SupervisedSlotStop {
+  readonly agentId: string;
+  readonly stopReason: string | null;
+  readonly notificationId: string | null;
+}
+
+/** An ensure that may not re-arm a stopped slot (issue #619): an autonomous
+ * one (a Gru wake) on any stop, or one without an intent on a stop restored
+ * from the previous process. A user action on the slot (a chat message) or a
+ * disposition on the named alert re-arms it. */
+export class SupervisedSlotStoppedError extends Error {
+  override readonly name = 'SupervisedSlotStoppedError';
+  readonly slotId: string;
+  readonly agentId: string;
+  readonly stopReason: string | null;
+  readonly notificationId: string | null;
+
+  constructor(input: SupervisedSlotStop & { readonly slotId: string; readonly by: string }) {
+    const alert = input.notificationId === null ? 'no open alert' : `alert ${input.notificationId}`;
+    super(
+      `supervised slot "${input.slotId}" is stopped (agent ${input.agentId}: ${input.stopReason ?? 'stopped'}; ${alert}); ` +
+        `${input.by} cannot re-arm it — a user action on the slot or a disposition on the alert re-arms it`,
+    );
+    this.slotId = input.slotId;
+    this.agentId = input.agentId;
+    this.stopReason = input.stopReason;
+    this.notificationId = input.notificationId;
+  }
+}
 
 /** The reason a boot settlement records on a previous process's open turn:
  * the `error` carried by its `agent.state` event and the orphan notice's
@@ -798,12 +838,15 @@ export class Supervisor {
       },
       canReplace: () => {
         const agent = this.slotAgent(internal);
-        if (agent === null || agent === undefined) return true;
+        // A stop restored from the previous process is still this slot's
+        // stop before any session is adopted for it (#619).
+        if (agent === null || agent === undefined) return this.restoredSlotStop(internal) === null;
         // A retained unproven predecessor fails closed (F60-P2): an open
         // breaker was never the only way a replacement may be refused.
         if (this.unprovenPredecessor(agent) !== null) return false;
         return agent.breakerOpen !== true;
       },
+      stop: () => this.slotStop(internal),
       adoptReplacement: (handle) => this.adoptSlotReplacement(internal, handle),
       release: () => {
         // Invalidate in-flight restart rungs before deleting their records.
@@ -828,10 +871,9 @@ export class Supervisor {
     slot: SupervisedSlotInternal,
     options?: SpawnOptions & { readonly intent?: 'user' | 'autonomous' },
   ): Promise<AgentHandle> {
+    const autonomous = options?.intent === 'autonomous';
     const existing = this.slotAgent(slot);
-    if (existing?.breakerOpen && options?.intent === 'autonomous') {
-      throw new Error(`supervised slot "${slot.id}" breaker is open; autonomous ensure cannot re-arm it`);
-    }
+    if (existing?.breakerOpen && autonomous) throw this.slotStoppedError(slot, existing.agentId, 'autonomous ensure');
     if (existing !== null && existing.handle !== null) return existing.handle;
     if (existing !== null && this.unprovenPredecessor(existing) !== null) {
       // Fail closed (F60-P2): the entity's predecessor stop is unproven, so a
@@ -856,41 +898,49 @@ export class Supervisor {
         existing.pendingRearmFenceAlert = null;
         existing.restartRing = [];
       } else {
-        // A caller-driven action (a chat message) is human intent: re-arm
-        // the stopped agent rather than serving it unsupervised — and the
-        // escalation row resolves with it (acked by the re-arm itself).
-        existing.breakerOpen = false;
-        existing.stopReason = null;
-        existing.stoppedAt = null;
-        const rearming = existing.breakerNotificationId;
-        existing.breakerNotificationId = null;
-        existing.pendingRearmFenceAlert = null;
-        existing.restartRing = [];
-        existing.consecutiveFailures = 0;
-        existing.state = 'watching';
-        this.restoredStops.delete(existing.agentId);
-        this.restoredRearmControls.delete(existing.agentId);
-        this.log('info', 'breaker re-armed by slot use — resuming supervision', {
-          agent_id: existing.agentId,
-          slot: slot.id,
-        });
-        this.ledger.appendCustomEvent({
-          kind: 'supervision.rearmed',
-          agentId: existing.agentId,
-          payload: { by: 'slot-use', slot: slot.id },
-        });
-        if (rearming !== null) {
-          // Owner release 2026-10-11: the escalation row is MACHINE
-          // attention now; human intent (this slot use) resumed the lane,
-          // so the row resolves by evidence — never acked, never stranded
-          // open behind a recovered agent.
-          this.ledger.resolveNotificationById(rearming, 'slot-use');
+        this.rearmBySlotUse(existing.agentId, slot);
+      }
+    }
+    if (existing === null) {
+      // #619: a stop restored from the previous process names its slot, so
+      // it is decided here, before any session is spawned for it.
+      // Only explicit user intent re-arms a restored stop; an ensure without
+      // an intent (the Bob and Silas schedulers) leaves it as it was before
+      // the restart, and an autonomous one is refused.
+      const restored = this.restoredSlotStop(slot);
+      if (restored !== null && autonomous) throw this.slotStoppedError(slot, restored, 'autonomous ensure');
+      if (restored !== null && options?.intent === 'user') {
+        const record = this.agents.get(restored);
+        if (record !== undefined && this.unprovenPredecessor(record) !== null) {
+          throw new Error(
+            `supervised slot "${slot.id}" predecessor stop is unproven; refusing to spawn until the adapter attests cessation`,
+          );
         }
+        this.rearmBySlotUse(restored, slot);
       }
     }
     const ensureGeneration = slot.generation;
     const { intent: _intent, ...spawnOptions } = options ?? {};
-    const handle = await slot.spawn(spawnOptions);
+    // #619: a resumed session keeps its stopped id, and the id is known only
+    // once spawned. Admission runs before publication, so the tap never
+    // adopts (and disposes) a session this ensure is about to hand out.
+    const admission: { refusal: SupervisedSlotStoppedError | null } = { refusal: null };
+    const handle = await slot.spawn(stageSpawnRegistration(spawnOptions, (spawned, publish) => {
+      admission.refusal = this.admitSlotSpawn(slot, spawned.id, options?.intent);
+      if (admission.refusal === null) publish();
+    }));
+    if (admission.refusal !== null) {
+      // Never published: no tap consumer saw it, and it holds no frames.
+      this.registry.quarantineHandle(handle);
+      await this.registry.disposeHandle(handle).catch((error: unknown) => {
+        this.log('warn', 'dispose of a refused stopped-slot spawn failed', {
+          agent_id: handle.id,
+          slot: slot.id,
+          error: String(error),
+        });
+      });
+      throw admission.refusal;
+    }
     if (this.disposed || this.slots.get(slot.id) !== slot) {
       await this.registry.disposeHandle(handle).catch(() => {});
       throw new Error(`supervised slot "${slot.id}" is not active`);
@@ -905,12 +955,162 @@ export class Supervisor {
       throw new Error(`supervised slot "${slot.id}" changed generation during ensure`);
     }
     this.adopt(handle, slot, options?.resumeFile ?? null);
+    const adopted = this.agents.get(handle.id);
+    if (adopted === undefined || adopted.handle !== handle || adopted.breakerOpen) {
+      // Never hand the caller a session supervision disposed or stopped
+      // (#619). Reached only when admission did not run (a slot spawn that
+      // drops the staged options); adopt() kept the record's handle empty,
+      // so the next user ensure re-arms the bound stop.
+      await this.registry.disposeHandle(handle).catch(() => {});
+      throw new Error(
+        `supervised slot "${slot.id}" spawned agent ${handle.id}, but that agent is stopped, ` +
+          'so supervision disposed the session instead of handing it out',
+      );
+    }
     // A handle death outside a restart rung (owner teardown) can leave a
     // stale slot-bound record shadowing the fresh one — retire stale
     // records so the NEXT ensure returns THIS handle (single-writer,
     // SPEC ruling 1), carrying the restart ring onto the live record.
     this.retireStaleSlotRecords(slot, handle.id);
     return handle;
+  }
+
+  /** A slot use is human intent: re-arm the stopped agent rather than serve
+   * it unsupervised, and resolve its alert with it. Covers a live record and
+   * a stop restored from the previous process alike (#619). */
+  private rearmBySlotUse(agentId: string, slot: SupervisedSlotInternal): void {
+    const record = this.agents.get(agentId);
+    const rearming = record?.breakerOpen === true
+      ? record.breakerNotificationId
+      : this.restoredRearmControls.get(agentId)?.notificationId ?? null;
+    if (record !== undefined) {
+      record.breakerOpen = false;
+      record.stopReason = null;
+      record.stoppedAt = null;
+      record.breakerNotificationId = null;
+      record.pendingRearmFenceAlert = null;
+      record.restartRing = [];
+      record.consecutiveFailures = 0;
+      record.state = 'watching';
+    }
+    this.restoredStops.delete(agentId);
+    this.restoredRearmControls.delete(agentId);
+    this.log('info', 'breaker re-armed by slot use — resuming supervision', {
+      agent_id: agentId,
+      slot: slot.id,
+    });
+    this.ledger.appendCustomEvent({
+      kind: 'supervision.rearmed',
+      agentId,
+      payload: { by: 'slot-use', slot: slot.id },
+    });
+    if (rearming !== null) {
+      // Owner release 2026-10-11: the escalation row is MACHINE
+      // attention now; human intent (this slot use) resumed the lane,
+      // so the row resolves by evidence — never acked, never stranded
+      // open behind a recovered agent.
+      this.ledger.resolveNotificationById(rearming, 'slot-use');
+    }
+  }
+
+  /** The agent id of a stop restored from the previous process that names
+   * this slot, while no record holds it or the record that holds it is still
+   * stopped; null when there is none (#619). */
+  private restoredSlotStop(slot: SupervisedSlotInternal): string | null {
+    for (const [agentId, stop] of this.restoredStops) {
+      if (stop.slotId !== slot.id || !stop.breakerOpen) continue;
+      const record = this.agents.get(agentId);
+      if (record === undefined || record.breakerOpen) return agentId;
+    }
+    return null;
+  }
+
+  /** The slot's current stop: its stopped record, or a stop restored from
+   * the previous process that names it; null when the slot is not stopped. */
+  private slotStop(slot: SupervisedSlotInternal): SupervisedSlotStop | null {
+    const agent = this.slotAgent(slot);
+    const agentId = agent?.breakerOpen === true ? agent.agentId : agent === null ? this.restoredSlotStop(slot) : null;
+    return agentId === null ? null : this.stopDetails(agentId);
+  }
+
+  /** The stop of a stopped agent, from its live record or its restored stop. */
+  private stopDetails(agentId: string): SupervisedSlotStop {
+    const record = this.agents.get(agentId);
+    if (record?.breakerOpen === true) {
+      return { agentId, stopReason: record.stopReason, notificationId: record.breakerNotificationId };
+    }
+    return {
+      agentId,
+      stopReason: this.restoredStops.get(agentId)?.stopReason ?? null,
+      notificationId: this.restoredRearmControls.get(agentId)?.notificationId ?? null,
+    };
+  }
+
+  /** Admission for a session a slot ensure just spawned, before it is
+   * published (#619). A session whose id is stopped is re-armed only by a
+   * user ensure. An autonomous ensure refuses it and binds the stop to this
+   * slot, so the next autonomous ensure is refused before any spawn; an
+   * ensure without an intent refuses it too. */
+  private admitSlotSpawn(
+    slot: SupervisedSlotInternal,
+    agentId: string,
+    intent: 'user' | 'autonomous' | undefined,
+  ): SupervisedSlotStoppedError | null {
+    if (!this.cfg.enabled) return null;
+    const record = this.agents.get(agentId);
+    const restored = this.restoredStops.get(agentId);
+    const stopped = record !== undefined ? record.breakerOpen : restored?.breakerOpen === true;
+    if (!stopped) return null;
+    if (intent === 'user') {
+      this.rearmBySlotUse(agentId, slot);
+      return null;
+    }
+    if (intent === 'autonomous' && record !== undefined && record.slot === null) {
+      record.slot = slot;
+      record.slotGeneration = slot.generation;
+      this.rememberStop(record);
+    } else if (intent === 'autonomous' && record === undefined && restored !== undefined) {
+      this.restoredStops.set(agentId, { ...restored, slotId: slot.id });
+    }
+    return this.slotStoppedError(slot, agentId, intent === 'autonomous' ? 'autonomous ensure' : 'an ensure without user intent');
+  }
+
+  private slotStoppedError(slot: SupervisedSlotInternal, agentId: string, by: string): SupervisedSlotStoppedError {
+    return new SupervisedSlotStoppedError({ ...this.stopDetails(agentId), slotId: slot.id, by });
+  }
+
+  /** A Gru disposition on the alert of a stop restored from the previous
+   * process, bound to a declared slot (#619). That stop is never adopted
+   * while it stays stopped (an autonomous ensure is refused before any
+   * spawn), so the disposition re-arms it here and the slot's next use
+   * spawns the session. Provider recovery that owns the stop, or a job
+   * binding (whose fences need a live record), keeps it refused. */
+  private rearmRestoredSlotStop(agentId: string, slot: SupervisedSlotInternal, notificationId: string): NotificationDispositionOutcome {
+    try {
+      const wait = this.ledger.openProviderWaitForAgent(agentId);
+      if (wait !== null) return { ok: false, reason: `open provider recovery ${wait.id} owns this stop` };
+      if ((this.ledger.getAgent(agentId)?.jobId ?? null) !== null) {
+        return {
+          ok: false,
+          reason: 'restored breaker has not been adopted by a live agent yet; keep this control open and retry after adoption',
+        };
+      }
+    } catch (error) {
+      return { ok: false, reason: `re-arm authority unavailable: ${String(error)}` };
+    }
+    this.restoredStops.delete(agentId);
+    this.restoredRearmControls.delete(agentId);
+    this.log('info', 'restored breaker re-armed by disposition — the slot spawns on its next use', {
+      agent_id: agentId,
+      slot: slot.id,
+      notification_id: notificationId,
+    });
+    this.ledger.appendCustomEvent({
+      kind: 'supervision.rearmed',
+      agentId,
+      payload: { notification_id: notificationId, slot: slot.id },
+    });
+    return { ok: true, rearmed: true };
   }
 
   private async adoptSlotReplacement(
@@ -921,7 +1121,11 @@ export class Supervisor {
       await this.registry.disposeHandle(handle).catch(() => {});
       throw new Error(`supervised slot "${slot.id}" is not active`);
     }
-    if ([...this.agents.values()].some((agent) => agent.slot === slot && agent.breakerOpen)) {
+    if (
+      [...this.agents.values()].some((agent) => agent.slot === slot && agent.breakerOpen) ||
+      // The same predicate canReplace() reads (#619).
+      (this.slotAgent(slot) === null && this.restoredSlotStop(slot) !== null)
+    ) {
       await this.registry.disposeHandle(handle).catch(() => {});
       throw new Error(`supervised slot "${slot.id}" breaker is open`);
     }
@@ -1319,6 +1523,30 @@ export class Supervisor {
       this.clearRecoveryAdmission(existing);
       this.agents.delete(agentId);
       existing = undefined;
+    }
+    if (
+      existing !== undefined && existing.breakerOpen && handle !== null && handle !== existing.handle &&
+      (slot !== null || existing.slot !== null)
+    ) {
+      // #619: a handle arriving for a stopped slot agent is disposed, never
+      // attached. An attached handle would be served by every later ensure
+      // while the agent stays stopped (dead, or alive and unsupervised). The
+      // slot binding still lands, so the slot's next user ensure re-arms it.
+      // A slotless producer (directive checkpoint recovery resuming a stopped
+      // minion) keeps the attach it always had.
+      if (slot !== null) {
+        existing.slot = slot;
+        existing.slotGeneration = slot.generation;
+        this.rememberStop(existing);
+      }
+      this.registry.quarantineHandle(handle);
+      void this.registry.disposeHandle(handle).catch((error: unknown) => {
+        this.log('warn', 'dispose of a handle that arrived for a stopped agent failed', {
+          agent_id: agentId,
+          error: String(error),
+        });
+      });
+      return true;
     }
     if (existing !== undefined) {
       existing.handle = handle ?? existing.handle;
@@ -2547,7 +2775,9 @@ export class Supervisor {
     this.ledger.appendCustomEvent({
       kind: 'supervision.escalated',
       agentId: agent.agentId,
-      payload: { class: failureClass, restarts: agent.restartRing.length },
+      // The slot rides the stop so a restart knows which slot is stopped
+      // before any session is spawned for it (#619).
+      payload: { class: failureClass, restarts: agent.restartRing.length, slot: agent.slot?.id ?? null },
     });
     const ledgerAgent = this.ledger.getAgent(agent.agentId);
     const observation = {
@@ -2584,7 +2814,7 @@ export class Supervisor {
           ? 'Machine-owned temporary provider limit: the recovery sensor owns this stop (no owner ACK required).'
           : 'Blind restart is withheld: this provider stop is not eligible for automatic recovery. ' +
             'Gru decides the direction (fix the provider condition, wait, or escalate a reserved ' +
-            'authority/cost decision) before anything re-arms.',
+            'authority/cost decision) before anything re-arms.' + GRU_SELF_STOP_HINT(agent.role),
         agentId: agent.agentId,
         dedupe: 'unacked',
       });
@@ -3738,6 +3968,7 @@ export class Supervisor {
         restarts: agent.restartRing.length,
         window_ms: this.cfg.restartWindowMs,
         reason: 'crash loop',
+        slot: agent.slot?.id ?? null,
       },
     });
     const notification = this.notifications.post({
@@ -3751,7 +3982,8 @@ export class Supervisor {
       title: `Crash-loop breaker tripped: agent ${agent.agentId} stopped`,
       detail:
         `${agent.restartRing.length} restarts within ${Math.round(this.cfg.restartWindowMs / 1000)}s. ` +
-        'The agent is STOPPED; a Gru disposition on this alert can re-arm the guarded restart ladder once the cause is addressed.',
+        'The agent is STOPPED; a Gru disposition on this alert can re-arm the guarded restart ladder once the cause is addressed.' +
+        GRU_SELF_STOP_HINT(agent.role),
       agentId: agent.agentId,
     });
     agent.breakerNotificationId = notification.id;
@@ -4195,7 +4427,7 @@ export class Supervisor {
         title: `Re-arm fenced: agent ${agent.agentId} stayed stopped`,
         detail:
           `The guarded restart was refused by a hold that appeared during the attempt (${reason}). ` +
-          'Resolve the hold, then dispose this alert to retry the re-arm.',
+          'Resolve the hold, then dispose this alert to retry the re-arm.' + GRU_SELF_STOP_HINT(agent.role),
         agentId: agent.agentId,
       });
       const pendingReason = agent.pendingRearmFenceAlert?.reason ?? reason;
@@ -4324,7 +4556,12 @@ export class Supervisor {
     // retry control while the agent has not yet been adopted.
     for (const [agentId, control] of this.restoredRearmControls) {
       if (control.notificationId !== notificationId) continue;
-      if (this.restoredStops.get(agentId)?.breakerOpen === true) {
+      const restored = this.restoredStops.get(agentId);
+      const restoredSlot = restored?.slotId === null || restored?.slotId === undefined ? undefined : this.slots.get(restored.slotId);
+      if (restored?.breakerOpen === true && restoredSlot !== undefined && !this.agents.has(agentId)) {
+        return this.rearmRestoredSlotStop(agentId, restoredSlot, notificationId);
+      }
+      if (restored?.breakerOpen === true) {
         return {
           ok: false,
           reason: 'restored breaker has not been adopted by a live agent yet; keep this control open and retry after adoption',
@@ -4476,7 +4713,7 @@ export class Supervisor {
         stops.set(agentId, {
           agentId,
           role: stop.role,
-          slotId: null,
+          slotId: stop.slotId,
           state: 'stopped',
           restarts: stop.restarts,
           breakerOpen: true,
@@ -4534,7 +4771,7 @@ export class Supervisor {
           title: `Re-arm fenced: agent ${agentId} stayed stopped`,
           detail:
             `The restored supervision stop has no live retry control (${reason}). ` +
-            'Resolve the reported condition, then dispose this alert to retry the re-arm.',
+            'Resolve the reported condition, then dispose this alert to retry the re-arm.' + GRU_SELF_STOP_HINT(stop.role),
           agentId,
         });
         this.restoredRearmControls.set(agentId, { notificationId: posted.id, pendingFenceReason: null });
@@ -4577,6 +4814,14 @@ export class Supervisor {
     if (notificationId === null && pendingFenceReason === null) {
       pendingFenceReason = stop.stopReason ?? 'restored supervision stop has no open retry control';
     }
+    // #619: a slotless record (the tap adopted the stopped id) belongs to the
+    // declared slot its restored stop names, so a disposition restarts it
+    // through that slot rather than spawning a session outside it.
+    const namedSlot = stop.slotId === null ? undefined : this.slots.get(stop.slotId);
+    if (agent.slot === null && namedSlot !== undefined) {
+      agent.slot = namedSlot;
+      agent.slotGeneration = namedSlot.generation;
+    }
     agent.breakerOpen = true;
     agent.state = 'stopped';
     agent.stopReason = stop.stopReason;
@@ -4613,7 +4858,9 @@ export class Supervisor {
     this.restoredStops.set(agent.agentId, {
       agentId: agent.agentId,
       role: agent.role,
-      slotId: agent.slot?.id ?? null,
+      // A slotless record (the tap adopted the stopped id) keeps the slot the
+      // restored stop names, so the slot stays stopped before spawn (#619).
+      slotId: agent.slot?.id ?? this.restoredStops.get(agent.agentId)?.slotId ?? null,
       state: 'stopped',
       restarts: agent.restartRing.length,
       breakerOpen: agent.breakerOpen,

@@ -384,10 +384,35 @@ is **stopped** (no further restarts), an **action-required** machine alert
 wakes Gru, and the board marks the agent (`⛔ stopped` on the rail + the
 alert). Gru **re-arms** supervision through the guarded disposition on
 that alert (or an operator resumes the lane by using its slot): the ring
-clears, a fresh window opens, one restart attempt resumes the agent. A
-service restart resets breaker state (in-memory by design) — the resolution
-record is durable, an open breaker is not, so a re-arm can never strand an
-agent across a service restart. The owner is never asked to ack a breaker.
+clears, a fresh window opens, one restart attempt resumes the agent. A stop
+survives a service restart: the ledger keeps it, with the slot it stopped,
+and the next process restores it at boot (#619). A restored stop on a slot
+is decided before any session is spawned for it:
+
+- an autonomous ensure (a Gru wake) is refused with
+  `SupervisedSlotStoppedError`, which names the stopped agent, the cause and
+  the alert;
+- a user action on the slot (a chat message) re-arms it and resolves its
+  alert, as it does before a restart;
+- a Gru disposition on its alert re-arms it too, unless an open provider
+  recovery owns the stop: with no session adopted yet, the slot's next use
+  spawns it; when another producer had resumed the stopped session first,
+  that record is bound to the slot and restarts through it;
+- an ensure without an intent (the Bob and Silas schedulers, which mint
+  fresh sessions) leaves it as it was, and would refuse a session that
+  resumed the stopped one.
+
+Chat says once per process that Gru is stopped, with the cause and the alert
+when they are recorded. A refused spawn (`SupervisedSlotStoppedError`) never
+arms the spawn-retry backoff, so the re-arming chat message is never turned
+away; every other spawn failure keeps it. When the stopped agent is Gru
+itself, its alerts say that a chat message to Gru re-arms it. A stop recorded
+before slots were persisted names no slot: the first wake that resumes the
+stopped session is refused and binds it for that process, until a chat
+message re-arms it. A handle arriving for a stopped slot agent is disposed,
+never attached, so no ensure hands out a dead session; a slotless producer
+(directive checkpoint recovery resuming a stopped minion) keeps the attach it
+always had. The owner is never asked to ack a breaker.
 
 **Superseded stops close (owner decision 2026-10-15, #385).** When the
 stopped turn's captured prompt was SUPERSEDED — the job was parked and
