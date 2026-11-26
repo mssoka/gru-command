@@ -4,7 +4,7 @@ import {
   REWRITE_RATIO,
   analyseProposal,
   droppableKeys,
-  isDroppable,
+  lostTail,
   changeSize,
   isCutOnly,
   lessonDiff,
@@ -189,23 +189,25 @@ describe('lessonName', () => {
 });
 
 describe('which changes the owner may drop', () => {
-  it('follows the server: the writer’s additions and updates and a retired chapter — never a cut or the cap’s archive record', () => {
-    const base = review();
-    const withFlags = review({
-      chapters: [
-        {
-          ...base.chapters[0]!,
-          added: [{ ...base.chapters[0]!.added[0]!, byWriter: true }, { slug: 'archived-provenance', body: 'Archive.', recurred: 1, tags: [], previousBody: null, previousRecurred: null, previousTags: null, byWriter: false }],
-          changed: [{ ...base.chapters[0]!.changed[0]!, byWriter: true }, { ...base.chapters[0]!.changed[1]!, byWriter: false }],
-        },
-        { ...base.chapters[1]!, slug: 'gone', retired: true, added: [], removed: [{ slug: 'x', body: 'X.', recurred: 1, tags: [], reason: 'retired' }] },
-      ],
-    });
-    expect(droppableKeys(withFlags)).toEqual(['gates/new-one', 'gates/reworded', 'gone']);
-    // Without the server's flag (an older server) the text test stands in.
-    expect(droppableKeys(review())).toEqual(['gates/new-one', 'gates/reworded', 'fresh/first']);
-    expect(isDroppable({ slug: 'archived-provenance', body: 'A.', recurred: 1, tags: [], previousBody: null, previousRecurred: null, previousTags: null })).toBe(false);
-    // The flag wins over the text test: a tags-only update that is also cut is still a choice.
+  it('exactly the ones the server names — and none from a server that names none', () => {
+    expect(droppableKeys(review({ choices: ['gates/new-one', 'gone'] }))).toEqual(['gates/new-one', 'gone']);
+    // An older server would ignore a drop and accept everything: offer nothing.
+    expect(droppableKeys(review())).toEqual([]);
+  });
+
+  it('the flag wins over the text test: a tags-only update that is also cut is still an update', () => {
     expect(isCutOnly({ ...changed('t', 'Long text here.', `Long text${LESSON_TRIM_MARKER}`, { recurred: 1, previousRecurred: 1 }), byWriter: true })).toBe(false);
+    expect(isCutOnly({ ...changed('t', 'Long text here.', `Long text${LESSON_TRIM_MARKER}`, { recurred: 1, previousRecurred: 1 }), byWriter: false })).toBe(true);
+  });
+
+  it('a cut lesson names the text it loses, from the whole text the server sent', () => {
+    const cutLesson = (fullBody: string | null | undefined) => ({
+      slug: 'n', body: `Drain the queue,${LESSON_TRIM_MARKER}`, recurred: 1, tags: [], previousBody: null, previousRecurred: null, previousTags: null,
+      ...(fullBody === undefined ? {} : { fullBody }),
+    });
+    expect(lostTail(cutLesson('Drain the queue, then wait for every job.'))).toBe(' then wait for every job.');
+    expect(lostTail(cutLesson(null))).toBeNull();
+    expect(lostTail(cutLesson(undefined))).toBeNull();
+    expect(lostTail({ ...cutLesson('x'), body: 'Not cut.' })).toBeNull();
   });
 });

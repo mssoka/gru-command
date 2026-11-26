@@ -189,6 +189,10 @@ export interface LessonChangeView {
    * the chapter cap touched it (a cut, or the cap's archive record): a side
    * effect, not a choice. */
   readonly byWriter: boolean;
+  /** The lesson's whole text when the chapter cap cut it (its body ends
+   * with the trim marker) — what is lost is shown, never hidden; null when
+   * the lesson is not cut. */
+  readonly fullBody: string | null;
 }
 
 /** A lesson the update removes, with the text and tags that disappear:
@@ -1146,9 +1150,17 @@ export function replanWithout(plan: BiblePlan, drop: ReadonlySet<string>): Bible
       }
       // dropped new lesson: left out
     }
-    // Every change dropped: the chapter stays exactly as it is (a new one
-    // is not created). A chapter with nothing to choose keeps its update.
-    if (offered > 0 && kept === 0) continue;
+    // Every lesson change dropped: a new chapter is not created; an existing
+    // one keeps its lessons as they were — and still takes its rename,
+    // description and labels (shown with no Keep / Drop of their own), or is
+    // left exactly as it is when it has none. A chapter with nothing to
+    // choose keeps its update.
+    if (offered > 0 && kept === 0) {
+      if (prior === null) continue;
+      const metadataChanged = prior.title !== write.uncapped.title || prior.summary !== write.uncapped.summary ||
+        prior.tags.join('\u0000') !== write.uncapped.tags.join('\u0000');
+      if (!metadataChanged) continue;
+    }
     chapters.set(write.slug, { ...write.uncapped, lessons });
     touched.add(write.slug);
   }
@@ -1161,45 +1173,101 @@ export function replanWithout(plan: BiblePlan, drop: ReadonlySet<string>): Bible
   });
 }
 
+/** A slug as the owner reads it ("shell-hang" → "Shell hang"). */
+function plainSlug(slug: string): string {
+  const words = slug.replace(/-+/gu, ' ').trim();
+  return words.charAt(0).toUpperCase() + words.slice(1);
+}
+
 /**
- * What a re-planned update would lose that the owner never saw in the
- * review they decided on — a lesson cut where it was whole (or cut shorter
- * than shown), a lesson removed or left out, a table-of-contents line cut
- * shorter — in plain words. Empty when every loss was already on screen.
+ * The lesson text a re-planned update would write or lose beyond what the
+ * reviewed update showed: a lesson cut where it was whole (or cut shorter
+ * than shown), text written that was never on screen, a lesson removed or
+ * left out. A lesson the review showed cut may come back longer, up to the
+ * whole text it showed struck; one the review showed removed may come back,
+ * whole or cut, within the text it showed.
  */
-export function unseenLosses(reviewed: PlanReview, revised: PlanReview): string[] {
-  const plain = (slug: string): string => {
-    const words = slug.replace(/-+/gu, ' ').trim();
-    return words.charAt(0).toUpperCase() + words.slice(1);
-  };
-  const untrimmed = (body: string): string => (body.endsWith(TRIM_MARKER) ? body.slice(0, -TRIM_MARKER.length) : body);
-  const shown = new Map<string, { readonly body: string; readonly chapter: string }>();
-  const gone = new Set<string>();
+export function unseenLessonLosses(reviewed: PlanReview, revised: PlanReview): string[] {
+  const shown = new Map<string, { readonly body: string; readonly whole: string }>();
+  const gone = new Map<string, string>();
   for (const chapter of reviewed.chapters) {
-    for (const lesson of [...chapter.added, ...chapter.changed]) shown.set(`${chapter.slug}/${lesson.slug}`, { body: lesson.body, chapter: chapter.title.after });
-    for (const lesson of chapter.removed) gone.add(`${chapter.slug}/${lesson.slug}`);
+    for (const lesson of [...chapter.added, ...chapter.changed]) {
+      shown.set(`${chapter.slug}/${lesson.slug}`, { body: lesson.body, whole: lesson.fullBody ?? untrimmed(lesson.body) });
+    }
+    for (const lesson of chapter.removed) gone.set(`${chapter.slug}/${lesson.slug}`, lesson.body);
   }
   const losses: string[] = [];
   for (const chapter of revised.chapters) {
     for (const lesson of [...chapter.added, ...chapter.changed]) {
-      if (!lesson.body.endsWith(TRIM_MARKER)) continue;
-      const before = shown.get(`${chapter.slug}/${lesson.slug}`);
-      // Seen: the review showed this very lesson cut, at most this far.
-      const seen = before !== undefined && before.body.endsWith(TRIM_MARKER) && untrimmed(lesson.body).startsWith(untrimmed(before.body).trimEnd());
-      if (!seen) losses.push(`“${plain(lesson.slug)}” in “${chapter.title.after}” would be cut short`);
+      const key = `${chapter.slug}/${lesson.slug}`;
+      const text = untrimmed(lesson.body).trimEnd();
+      const cut = lesson.body.endsWith(TRIM_MARKER);
+      const before = shown.get(key);
+      const removedText = gone.get(key);
+      // The text written must have been on screen: within the whole text
+      // the review showed (struck tail included), or a removed card's text.
+      const onScreen = (before !== undefined && before.whole.startsWith(text)) ||
+        (removedText !== undefined && removedText.startsWith(text));
+      if (!onScreen) {
+        losses.push(`“${plainSlug(lesson.slug)}” in “${chapter.title.after}” would ${cut ? 'be cut short' : 'read differently from the review'}`);
+        continue;
+      }
+      // A cut must go no further than the one shown (a removed lesson coming
+      // back cut is more than the review promised, never less).
+      if (cut && before !== undefined && removedText === undefined) {
+        const shownCut = before.body.endsWith(TRIM_MARKER) ? untrimmed(before.body).trimEnd() : null;
+        if (shownCut === null || !text.startsWith(shownCut)) losses.push(`“${plainSlug(lesson.slug)}” in “${chapter.title.after}” would be cut short`);
+      }
     }
     for (const lesson of chapter.removed) {
       if (lesson.reason === 'retired' || gone.has(`${chapter.slug}/${lesson.slug}`)) continue;
-      losses.push(`“${plain(lesson.slug)}” in “${chapter.title.after}” would be ${lesson.reason === 'discarded' ? 'left out' : 'removed'}`);
+      losses.push(`“${plainSlug(lesson.slug)}” in “${chapter.title.after}” would be ${lesson.reason === 'discarded' ? 'left out' : 'removed'}`);
     }
   }
-  const reviewedIndex = new Map(reviewed.index.map((entry) => [entry.slug, entry]));
-  for (const entry of revised.index) {
-    const summary = entry.after?.summary ?? null;
-    if (summary === null || !summary.endsWith('…')) continue;
-    const before = reviewedIndex.get(entry.slug)?.after?.summary ?? null;
-    const seen = before !== null && before.endsWith('…') && summary.slice(0, -1).startsWith(before.slice(0, -1).trimEnd());
-    if (!seen) losses.push(`the table-of-contents line of “${plain(entry.slug)}” would be cut short`);
+  return losses;
+}
+
+/** How the INDEX shows each chapter of the book a plan produces: whether
+ * its labels were dropped to fit and how its line was cut. */
+function indexCompaction(plan: BiblePlan): Map<string, { readonly tagsDropped: boolean; readonly cut: string | null }> {
+  const { result } = verifyPlan(plan);
+  const contract = planContract(plan);
+  const out = new Map<string, { readonly tagsDropped: boolean; readonly cut: string | null }>();
+  for (const entry of parseIndex(plan.indexText, contract)) {
+    const text = result.get(`${BIBLE_CHAPTERS_DIR}/${entry.slug}.md`);
+    if (text === undefined) continue;
+    const chapter = parseChapter(text, entry.slug, contract);
+    const whole = collapseLine(chapter.summary);
+    out.set(entry.slug, {
+      tagsDropped: entry.tags.length < chapter.tags.length,
+      cut: entry.summary === whole ? null : entry.summary.replace(/…$/u, '').trimEnd(),
+    });
+  }
+  return out;
+}
+
+/**
+ * What a re-planned update would lose that the owner never saw in the
+ * review they decided on — lesson text (unseenLessonLosses), a
+ * table-of-contents line that loses its labels or is cut shorter, and more
+ * old source notes released to fit — in plain words. Empty when every
+ * loss was already on screen.
+ */
+export function unseenLosses(reviewedPlan: BiblePlan, revisedPlan: BiblePlan): string[] {
+  const reviewed = describePlan(reviewedPlan);
+  const revised = describePlan(revisedPlan);
+  const losses = unseenLessonLosses(reviewed, revised);
+  const before = indexCompaction(reviewedPlan);
+  for (const [slug, now] of indexCompaction(revisedPlan)) {
+    const shown = before.get(slug);
+    if (now.tagsDropped && shown?.tagsDropped !== true) losses.push(`the table of contents would lose the labels of “${plainSlug(slug)}”`);
+    if (now.cut !== null && (shown?.cut == null || !now.cut.startsWith(shown.cut))) {
+      losses.push(`the table-of-contents line of “${plainSlug(slug)}” would be cut short`);
+    }
+  }
+  const released = (review: PlanReview): number => review.chapters.reduce((sum, chapter) => sum + chapter.provenanceTrimmed, 0);
+  if (released(revised) > released(reviewed)) {
+    losses.push(`${released(revised)} old source notes would be dropped to fit, not the ${released(reviewed)} shown`);
   }
   return losses;
 }
@@ -1250,6 +1318,7 @@ function describeChapterChange(before: BibleChapter | null, uncapped: BibleChapt
       previousRecurred: prior?.recurred ?? null,
       previousTags: prior?.tags ?? null,
       byWriter: incoming !== undefined && (prior === undefined || !sameLesson(prior, incoming)),
+      fullBody: lesson.body.endsWith(TRIM_MARKER) ? untrimmed(incoming?.body ?? prior?.body ?? lesson.body) : null,
     };
     if (prior === undefined) added.push(view);
     else if (prior.body !== lesson.body || prior.recurred !== lesson.recurred || prior.tags.join('\u0000') !== lesson.tags.join('\u0000')) {

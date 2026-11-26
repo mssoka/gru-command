@@ -2,7 +2,7 @@ import { randomUUID } from 'node:crypto';
 import { existsSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 import type { LogLevel } from '../logger.js';
-import { BibleLockReleaseError, checkPlan, describePlan, replanWithout, unseenLosses, type ApplyReport, type BiblePlan, type BibleStore, type PlanReview } from './bible.js';
+import { BibleLockReleaseError, checkPlan, describePlan, PLAN_CONTRACT, planChoices, replanWithout, unseenLosses, type ApplyReport, type BiblePlan, type BibleStore, type PlanReview } from './bible.js';
 import { BibleError, DreamError, isLessonsSlug, ProposalError, type JournalEntry, type ProposedChapter } from './types.js';
 import { ownerNoticeWithFallback } from '../notifications/owner-language.js';
 
@@ -447,6 +447,9 @@ export interface LessonProposalReview {
   /** What the update is about, in one plain sentence (null when the
    * distiller wrote none). */
   readonly overview: string | null;
+  /** The changes the owner may drop with Keep / Drop (`<chapter>/<lesson>`
+   * or `<chapter>` for a retirement); empty once a decision is recorded. */
+  readonly choices: readonly string[];
   /** The owner's decision when it is recorded but not yet finished — the
    * same decision finishes it; the opposite one is refused. */
   readonly decision: { readonly kind: 'accepted' | 'rejected'; readonly at: string; readonly dropped?: readonly string[] } | null;
@@ -598,6 +601,9 @@ export class LessonProposals {
       chapters: review.chapters,
       index: review.index,
       overview: proposal.overview ?? null,
+      // What the owner may drop — only while undecided, and only for a plan
+      // today's planning contract can re-plan (an older one is decided whole).
+      choices: recorded === null && (proposal.plan.contract ?? 1) === PLAN_CONTRACT ? [...planChoices(proposal.plan)].sort() : [],
       decision: recorded,
       recovery: proposal.recovery,
     };
@@ -720,7 +726,7 @@ export class LessonProposals {
         if (error instanceof BibleError) throw new ProposalError('choices', error.message);
         throw error;
       }
-      const losses = unseenLosses(describePlan(proposal.plan), describePlan(plan));
+      const losses = unseenLosses(proposal.plan, plan);
       if (losses.length > 0) {
         throw new ProposalError(
           'overflow',

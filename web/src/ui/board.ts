@@ -1233,7 +1233,7 @@ export class BoardView {
     const choices = el('div', 'board-lessons__choices');
     const buttons = this.lessonDecisionButtons(current, row.actionId, `${focusBase}`);
     if (this.lessonKeepShown(current) && review !== null) {
-      const count = droppedCount(review, current.dropped);
+      const count = droppedCount(review, current);
       const keepTile = el('div', 'board-lessons__choice board-lessons__choice--keep');
       keepTile.append(
         buttons.keep,
@@ -1472,6 +1472,7 @@ export class BoardView {
       }
       top.append(filters);
       body.append(lessonChanges(review, current.filter, {
+        offered: new Set(droppableKeys(review)),
         dropped: current.dropped,
         locked: this.lessonChoicesLocked(current),
         onChange: (key, drop) => {
@@ -1486,19 +1487,25 @@ export class BoardView {
     }
     const foot = el('div', 'board-lessons-sheet__foot');
     const hint = el('div', 'board-lessons-sheet__hint');
-    if (review !== null && current.dropped.size > 0) {
-      hint.append(`Dropping ${plural(droppedCount(review, current.dropped), 'change')}. Save my choices writes everything else. `);
-      const reset = el('button', 'board-lessons-sheet__reset', 'Keep all again');
-      reset.type = 'button';
-      reset.dataset.sheetFocus = 'reset';
-      reset.disabled = this.lessonChoicesLocked(current);
-      reset.addEventListener('click', () => {
-        if (this.lessonChoicesLocked(current)) return;
-        current.dropped.clear();
-        this.rerenderOwner();
-        this.renderLessonSheet(id, current);
-      });
-      hint.append(reset);
+    if (review !== null && this.lessonKeepShown(current)) {
+      const count = droppedCount(review, current);
+      if (current.recorded === 'keep') {
+        hint.append(`Your choices are recorded: ${plural(count, 'change')} dropped. This review shows what will be written.`);
+      } else {
+        hint.append(`Dropping ${plural(count, 'change')}. Save my choices writes everything else. `);
+        if (!this.lessonChoicesLocked(current)) {
+          const reset = el('button', 'board-lessons-sheet__reset', 'Keep all again');
+          reset.type = 'button';
+          reset.dataset.sheetFocus = 'reset';
+          reset.addEventListener('click', () => {
+            if (this.lessonChoicesLocked(current)) return;
+            current.dropped.clear();
+            this.rerenderOwner();
+            this.renderLessonSheet(id, current);
+          });
+          hint.append(reset);
+        }
+      }
     } else {
       hint.append(
         review === null
@@ -4464,9 +4471,12 @@ function restoreOwnerFocusKey(key: string | null, root: HTMLElement): void {
   }
 }
 
-/** How many of the changes the owner may choose are dropped. */
-function droppedCount(review: LessonProposalView, dropped: ReadonlySet<string>): number {
-  return droppableKeys(review).filter((key) => dropped.has(key)).length;
+/** How many changes the owner dropped: what a pending or recorded "Save
+ * my choices" sent (a recorded one's review shows the plan being written,
+ * which no longer lists them), else the current Keep / Drop. */
+function droppedCount(review: LessonProposalView, current: ProposalRowState): number {
+  if (current.submittedDrop !== null) return current.submittedDrop.length;
+  return droppableKeys(review).filter((key) => current.dropped.has(key)).length;
 }
 
 /** The owner's three choices on a lesson proposal: Accept all, Reject all,

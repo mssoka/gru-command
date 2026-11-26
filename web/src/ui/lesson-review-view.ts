@@ -18,7 +18,7 @@ import {
   CHANGE_SIZE_LABEL,
   REMOVED_REASON,
   changeKey,
-  isDroppable,
+  lostTail,
   REWRITE_RATIO,
   changeSize,
   isCutOnly,
@@ -50,6 +50,8 @@ export const LESSON_FILTERS: readonly { readonly id: LessonFilter; readonly labe
  * 2026-11-26): which changes are dropped, whether they may still change,
  * and how to change one. */
 export interface LessonChoices {
+  /** The changes the server lets the owner drop (the only ones offered). */
+  readonly offered: ReadonlySet<string>;
   readonly dropped: ReadonlySet<string>;
   /** Fixed: a decision is in flight or recorded, or the board is stale. */
   readonly locked: boolean;
@@ -165,6 +167,13 @@ function cutMark(): HTMLElement {
   return el('span', 'board-lessons__cutmark', '✂ cut here to fit');
 }
 
+/** After the cut mark, the text the cut loses — struck, so nothing the cap
+ * takes away is hidden. */
+function appendLost(text: HTMLElement, lesson: LessonChangeView): void {
+  const tail = lostTail(lesson);
+  if (tail !== null) text.append(el('del', 'board-lessons__del board-lessons__lost', tail));
+}
+
 /** One paragraph with the changes marked in place. */
 function markedText(segments: readonly DiffSegment[], cut: boolean): HTMLElement {
   const text = el('p', 'board-lessons__text');
@@ -240,10 +249,11 @@ function newLesson(lesson: LessonChangeView, chapterSlug: string, choices?: Less
   );
   const body = el('p', 'board-lessons__text', text);
   if (cut) body.append(cutMark());
+  appendLost(body, lesson);
   node.append(body);
   const labels = plainLabels(lesson.tags);
   if (labels !== null) node.append(labels);
-  if (choices !== undefined && isDroppable(lesson)) {
+  if (choices !== undefined && choices.offered.has(changeKey(chapterSlug, lesson.slug))) {
     const key = changeKey(chapterSlug, lesson.slug);
     node.querySelector('.board-lessons__lesson-head')!.append(keepDrop(key, lessonName(lesson.slug), choices));
     if (choices.dropped.has(key)) markDropped(node, 'Dropped: this lesson will not be added.');
@@ -285,13 +295,18 @@ function changedLesson(lesson: LessonChangeView, chapterSlug: string, choices?: 
     }
   }
   node.append(why);
-  node.append(!diff.cutOnly && diff.ratio >= REWRITE_RATIO ? beforeAfter(diff.segments, diff.cut) : markedText(diff.segments, diff.cut));
+  const shown = !diff.cutOnly && diff.ratio >= REWRITE_RATIO ? beforeAfter(diff.segments, diff.cut) : markedText(diff.segments, diff.cut);
+  if (!diff.cutOnly) {
+    const after = shown.classList.contains('board-lessons__pair') ? shown.querySelectorAll('.board-lessons__text')[1] : shown;
+    if (after instanceof HTMLElement) appendLost(after, lesson);
+  }
+  node.append(shown);
   if (lesson.previousTags !== null) {
     const labels = labelsLine(lesson.previousTags, lesson.tags);
     if (labels !== null) node.append(labels);
   }
   if (choices !== undefined) {
-    if (isDroppable(lesson)) {
+    if (choices.offered.has(changeKey(chapterSlug, lesson.slug))) {
       const key = changeKey(chapterSlug, lesson.slug);
       node.querySelector('.board-lessons__lesson-head')!.append(keepDrop(key, lessonName(lesson.slug), choices));
       if (choices.dropped.has(key)) {
@@ -377,7 +392,7 @@ function chapterHead(chapter: LessonChapterChangeView, toc: LessonIndexChangeVie
   const title = el('div', 'board-lessons__chapter-title');
   title.append(el('h3', 'board-lessons__chapter-name', chapter.title.after));
   if (chapter.retired) title.append(el('span', 'board-lessons__badge board-lessons__badge--removed', 'Chapter removed'));
-  if (chapter.retired && choices !== undefined) {
+  if (chapter.retired && choices !== undefined && choices.offered.has(changeKey(chapter.slug))) {
     const key = changeKey(chapter.slug);
     title.append(keepDrop(key, `remove the chapter ${chapter.title.after}`, choices));
     if (choices.dropped.has(key)) head.dataset.dropped = 'true';

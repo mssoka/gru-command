@@ -25,6 +25,7 @@ import {
   renderIndex,
   serializeChapter,
   TRIM_MARKER,
+  unseenLessonLosses,
 } from '../src/lessons/bible.js';
 import { JournalStore } from '../src/lessons/journal.js';
 import { createBibleReferences } from '../src/lessons/references.js';
@@ -1017,6 +1018,7 @@ describe('plan, then apply only onto the planned book (owner decision 2026-10-07
             previousRecurred: null,
             previousTags: null,
             byWriter: true,
+            fullBody: null,
           },
         ],
         changed: [
@@ -2350,5 +2352,44 @@ describe('fifth review round of #253 — follow-up (bmad-code-review, 2026-10-08
     const lesson = write.uncapped.lessons[0]!;
     const forged = { ...plan, writes: [{ ...write, uncapped: { ...write.uncapped, lessons: [{ ...lesson, provenance: [...lesson.provenance, lesson.provenance.at(-1)!] }] } }] };
     expect(() => checkPlan(forged)).toThrowError(/pre-cap provenance repeats j-5/);
+  });
+});
+
+describe('Keep / Drop: what a re-planned update may write (owner request 2026-11-26)', () => {
+  it('only text that was on screen: a cut no further than shown, a shown cut written whole, a lesson shown removed coming back — and nothing else', () => {
+    const cut = (text: string) => `${text}${TRIM_MARKER}`;
+    const lesson = (slug: string, body: string, fullBody: string | null = null) => ({
+      slug, body, recurred: 1, tags: [], previousBody: null, previousRecurred: null, previousTags: null, byWriter: true, fullBody,
+    });
+    const review = (
+      added: ReturnType<typeof lesson>[],
+      removed: { slug: string; body: string; reason: 'cap' | 'discarded' }[] = [],
+    ) => ({
+      chapters: [{
+        slug: 'ops', title: { before: 'Ops', after: 'Ops' }, retired: false,
+        summary: { before: 'x', after: 'x' }, tags: { before: [], after: [] },
+        added, changed: [], removed: removed.map((item) => ({ ...item, recurred: 1, tags: [] })),
+        provenanceTrimmed: 0, bodiesTrimmed: 0,
+      }],
+      index: [],
+    });
+    const whole = 'Drain the queue, then wait for every job to settle.';
+    const reviewed = review([lesson('drain', cut('Drain the queue,'), whole)], [{ slug: 'old-note', body: 'An old note the cap drops.', reason: 'cap' }]);
+    // The shown cut, a longer cut of the same text, the whole text shown struck: all seen.
+    for (const body of [cut('Drain the queue,'), cut('Drain the queue, then wait'), whole]) {
+      expect(unseenLessonLosses(reviewed, review([lesson('drain', body)])), body).toEqual([]);
+    }
+    // The lesson the review showed removed comes back — whole or cut — within its shown text.
+    expect(unseenLessonLosses(reviewed, review([lesson('old-note', cut('An old note'))]))).toEqual([]);
+    expect(unseenLessonLosses(reviewed, review([lesson('old-note', 'An old note the cap drops.')]))).toEqual([]);
+    // Cut further than shown, text never shown, a lesson the review never listed now cut.
+    expect(unseenLessonLosses(reviewed, review([lesson('drain', cut('Drain'))]))).toEqual(['“Drain” in “Ops” would be cut short']);
+    expect(unseenLessonLosses(reviewed, review([lesson('drain', 'Drain the queue twice.')]))).toEqual(['“Drain” in “Ops” would read differently from the review']);
+    expect(unseenLessonLosses(reviewed, review([lesson('quiet', cut('A lesson the review never listed'))]))).toEqual(['“Quiet” in “Ops” would be cut short']);
+    // A removal or a left-out lesson the review did not show.
+    expect(unseenLessonLosses(review([]), review([], [{ slug: 'gone', body: 'G.', reason: 'cap' }, { slug: 'new', body: 'N.', reason: 'discarded' }]))).toEqual([
+      '“Gone” in “Ops” would be removed',
+      '“New” in “Ops” would be left out',
+    ]);
   });
 });

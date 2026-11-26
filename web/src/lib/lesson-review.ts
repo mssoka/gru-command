@@ -327,19 +327,20 @@ export function changeKey(chapterSlug: string, lessonSlug?: string): string {
   return lessonSlug === undefined ? chapterSlug : `${chapterSlug}/${lessonSlug}`;
 }
 
-/** A change the owner may keep or drop: one the lesson writer made. Cuts,
- * cap removals and the cap's archive record are side effects. */
-export function isDroppable(lesson: LessonChangeView): boolean {
-  if (lesson.byWriter !== undefined) return lesson.byWriter;
-  return lesson.slug !== ARCHIVED_LESSON_SLUG && !isCutOnly(lesson);
+/** Every change of a proposal the owner may drop, by key — exactly the
+ * list the server names (it re-plans only those). A server that names none
+ * (one that predates Keep / Drop) offers none: a drop it would ignore must
+ * never be sent. */
+export function droppableKeys(review: LessonProposalView): string[] {
+  return [...(review.choices ?? [])];
 }
 
-/** Every change of a proposal the owner may drop, by key. */
-export function droppableKeys(review: LessonProposalView): string[] {
-  const keys: string[] = [];
-  for (const chapter of review.chapters) {
-    if (chapter.retired) keys.push(changeKey(chapter.slug));
-    for (const lesson of [...chapter.added, ...chapter.changed]) if (isDroppable(lesson)) keys.push(changeKey(chapter.slug, lesson.slug));
-  }
-  return keys;
+/** The text a cut lesson loses: the rest of its whole text after the cut
+ * (null when it is not cut, or the server did not send the whole text). */
+export function lostTail(lesson: LessonChangeView): string | null {
+  const { text, cut } = splitCut(lesson.body);
+  if (!cut || lesson.fullBody === undefined || lesson.fullBody === null) return null;
+  const kept = text.trimEnd();
+  const tail = lesson.fullBody.startsWith(kept) ? lesson.fullBody.slice(kept.length) : null;
+  return tail === null || tail.trim() === '' ? null : tail;
 }

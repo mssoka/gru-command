@@ -3715,6 +3715,8 @@ describe('FOR YOU owner band (permanent, top of board)', () => {
           bodiesTrimmed: 0,
         },
       ],
+      // The server names what may be dropped; the board offers only these.
+      choices: ['model-policy', 'ops/close-shell', 'ops/drain'],
       ...overrides,
     });
   }
@@ -3789,24 +3791,60 @@ describe('FOR YOU owner band (permanent, top of board)', () => {
     expect(sheet.querySelector<HTMLButtonElement>('.board-lessons-sheet__actions .board-owner__accept')!.disabled).toBe(false);
   });
 
-  it('a "Save my choices" recorded elsewhere shows those choices, and only Save my choices can finish it', async () => {
-    const recorded = choicesReview({ decision: { kind: 'accepted', at: '2026-01-01T00:05:00.000Z', dropped: ['ops/drain'] } });
-    const client = proposalClient(decided, recorded);
+  it('a "Save my choices" recorded elsewhere says how many changes were dropped, and only Save my choices can finish it', async () => {
+    // As a real server sends it once recorded: the review is the plan being
+    // written (the dropped rewording of `drain` is no longer listed), and
+    // nothing is left to choose.
+    const written = choicesReview({
+      choices: [],
+      decision: { kind: 'accepted', at: '2026-01-01T00:05:00.000Z', dropped: ['ops/drain'] },
+    });
+    const ops = written.chapters[0]!;
+    written.chapters[0] = { ...ops, changed: ops.changed.filter((lesson: { slug: string }) => lesson.slug !== 'drain') };
+    const client = proposalClient(decided, written);
     const view = new BoardView(() => {}, client);
     view.render(snapshot({ notifications: [proposalNotice] }));
     await flush();
     const band = document.getElementById('board-owner')!;
     expect(band.querySelector('[role="alert"]')?.textContent).toBe('Your choices are recorded but not finished — press Save my choices to finish it.');
+    expect(band.querySelector('.board-lessons__choice--keep')?.textContent).toBe('✓ Save my choicesWrites everything except the 1 change you dropped, which stays as it is.');
     const keep = band.querySelector<HTMLButtonElement>('.board-lessons__keep')!;
     expect([keep.disabled, band.querySelector<HTMLButtonElement>('.board-owner__accept')!.disabled, band.querySelector<HTMLButtonElement>('.board-owner__reject')!.disabled])
       .toEqual([false, true, true]);
     const sheet = openReview();
-    expect(keepDropOf('ops/drain', 'drop').getAttribute('aria-pressed')).toBe('true');
-    expect(keepDropOf('ops/drain', 'keep').disabled).toBe(true);
+    expect(sheet.querySelector('.board-lessons-sheet__hint')?.textContent).toBe('Your choices are recorded: 1 change dropped. This review shows what will be written.');
+    expect(sheet.querySelector('.board-lessons__keep-drop')).toBeNull(); // nothing left to choose
     keep.click();
     await flush();
     expect(client.decideLessonProposal).toHaveBeenCalledWith('prop-1', 'accept', ['ops/drain']);
     expect(sheet.open).toBe(true);
+  });
+
+  it('a server that names no choices gets no Keep / Drop — a drop it would ignore is never sent', async () => {
+    const view = new BoardView(() => {}, proposalClient(decided, choicesReview({ choices: undefined })));
+    view.render(snapshot({ notifications: [proposalNotice] }));
+    await flush();
+    const sheet = openReview();
+    expect(sheet.querySelector('.board-lessons__keep-drop')).toBeNull();
+    expect(document.querySelector('.board-lessons__keep')).toBeNull();
+    expect(sheet.querySelector<HTMLButtonElement>('.board-lessons-sheet__actions .board-owner__accept')!.disabled).toBe(false);
+  });
+
+  it('a cut lesson shows the text the cut loses, struck after the cut mark', async () => {
+    const cut = ' … [trimmed to fit the chapter cap]';
+    const view = new BoardView(() => {}, proposalClient(decided, proposalReview({
+      chapters: [{
+        slug: 'ops', title: { before: 'Ops', after: 'Ops' }, retired: false,
+        summary: { before: 'x', after: 'x' }, tags: { before: [], after: [] },
+        added: [lessonChange('drain', `Drain the queue,${cut}`, { byWriter: true, fullBody: 'Drain the queue, then wait for every job.' })],
+        changed: [], removed: [], provenanceTrimmed: 0, bodiesTrimmed: 1,
+      }],
+    })));
+    view.render(snapshot({ notifications: [proposalNotice] }));
+    await flush();
+    const text = openReview().querySelector('.board-lessons__lesson .board-lessons__text')!;
+    expect(text.textContent).toBe('Drain the queue,✂ cut here to fit then wait for every job.');
+    expect(text.querySelector('del.board-lessons__lost')?.textContent).toBe(' then wait for every job.');
   });
 
   it('a snapshot push keeps the review open, its text loaded, and an in-flight decision locked on the card and in the sheet', async () => {
