@@ -292,7 +292,7 @@ const PINS: Record<string, number> = {
   'line-safe.test.ts': 2,
   'lessons-bible-lock.test.ts': 5,
   'lessons-capture.test.ts': 14,
-  'lessons-dream.test.ts': 65,
+  'lessons-dream.test.ts': 67,
   'lessons-dream-service.test.ts': 8,
   'lessons-e2e.test.ts': 2,
   'lessons-injection.test.ts': 9,

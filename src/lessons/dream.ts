@@ -165,6 +165,9 @@ export interface DistillInput {
 
 export interface DistillResult {
   readonly chapters: readonly ProposedChapter[];
+  /** One plain sentence for the owner on what the update teaches (owner
+   * pick 2026-11-26: written in the same distiller pass, no extra call). */
+  readonly overview?: string;
 }
 
 /** The judgment port: production = Bob via the supervised slot; tests use
@@ -322,6 +325,7 @@ export class DreamEngine {
         fromState: state,
         batch: { afterSeq: Math.max(first.seq - 1, replay?.afterSeq ?? state.coveredThroughSeq), throughSeq: last.seq },
         nextState,
+        overview: result.overview ?? null,
       });
       this.log('info', 'dream pass proposed — awaiting the owner in For You', {
         proposal_id: proposal.id,
@@ -408,6 +412,9 @@ export interface LessonProposal {
   /** The dream state after an Accept or Reject (both consume the batch). */
   readonly nextState: DreamState;
   readonly plan: BiblePlan;
+  /** The distiller's one-sentence summary for the owner; absent on records
+   * written before it existed (read as none). */
+  readonly overview?: string | null;
   readonly decision: {
     readonly kind: ProposalDecisionKind;
     readonly at: string;
@@ -433,6 +440,9 @@ export interface LessonProposalReview {
   readonly throughSeq: number;
   readonly chapters: PlanReview['chapters'];
   readonly index: PlanReview['index'];
+  /** What the update is about, in one plain sentence (null when the
+   * distiller wrote none). */
+  readonly overview: string | null;
   /** The owner's decision when it is recorded but not yet finished — the
    * same decision finishes it; the opposite one is refused. */
   readonly decision: { readonly kind: 'accepted' | 'rejected'; readonly at: string } | null;
@@ -583,6 +593,7 @@ export class LessonProposals {
       throughSeq: proposal.batch.throughSeq,
       chapters: review.chapters,
       index: review.index,
+      overview: proposal.overview ?? null,
       decision: recorded,
       recovery: proposal.recovery,
     };
@@ -595,6 +606,7 @@ export class LessonProposals {
     readonly fromState: DreamState;
     readonly batch: ReplayRange;
     readonly nextState: DreamState;
+    readonly overview?: string | null;
   }): LessonProposal {
     if (this.pending() !== null) throw new DreamError('a lesson proposal is already pending');
     const id = randomUUID();
@@ -608,6 +620,7 @@ export class LessonProposals {
       batch: input.batch,
       nextState: input.nextState,
       plan: input.plan,
+      overview: input.overview ?? null,
       decision: null,
       recovery: null,
       committed: null,
@@ -931,6 +944,8 @@ function validateLessonProposal(value: unknown, where: string): LessonProposal {
     : [...(batch.throughSeq < head.throughSeq ? [{ afterSeq: batch.throughSeq, throughSeq: head.throughSeq }] : []), ...ranges.slice(1)];
   if (JSON.stringify(nextState.replay ?? []) !== JSON.stringify(remainder)) fail('nextState replay remainder');
 
+  const overview = row['overview'];
+  if (overview !== undefined && overview !== null && typeof overview !== 'string') fail('overview');
   const plan = record(row['plan'], 'plan');
   // Absent or 1: planned under the first release's contract (R6-01); 2:
   // today's. Anything else this build cannot verify.

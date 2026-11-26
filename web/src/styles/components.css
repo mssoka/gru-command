@@ -2780,6 +2780,15 @@ body {
   line-height: 1.5;
 }
 
+.board-lessons__overview {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  max-width: 68ch;
+  color: var(--on-state);
+  font-size: 14px;
+}
+
 .board-lessons__tally {
   display: flex;
   flex-wrap: wrap;

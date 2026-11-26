@@ -3663,6 +3663,25 @@ describe('FOR YOU owner band (permanent, top of board)', () => {
     expect(client.getLessonProposal).toHaveBeenCalledTimes(1);
   });
 
+  it('Gru’s one-sentence summary of the update speaks on the card and atop the review — and nothing stands in for a missing one', async () => {
+    const said = 'Minions learn to close the shell before a restart.';
+    const view = new BoardView(() => {}, proposalClient(decided, proposalReview({ overview: said })));
+    view.render(snapshot({ notifications: [proposalNotice] }));
+    await flush();
+    const card = document.getElementById('board-owner')!.querySelector<HTMLElement>('[data-proposal-id="lp-1"]')!;
+    expect(card.querySelector('.board-lessons__overview')?.textContent).toBe(`🧠Gru: ${said}`);
+    expect(card.querySelector('.board-lessons__overview .board-notification__gru-bubble')).not.toBeNull();
+    const sheet = openReview();
+    expect(sheet.querySelector('.board-lessons-sheet__top .board-lessons__overview')?.textContent).toBe(`🧠Gru: ${said}`);
+    for (const overview of [null, undefined, '  ']) {
+      const quiet = new BoardView(() => {}, proposalClient(decided, proposalReview({ overview })));
+      quiet.render(snapshot({ notifications: [proposalNotice] }));
+      await flush();
+      expect(document.getElementById('board-owner')!.querySelector('.board-lessons__tally'), String(overview)).not.toBeNull();
+      expect(document.getElementById('board-owner')!.querySelector('.board-lessons__overview'), String(overview)).toBeNull();
+    }
+  });
+
   it('a snapshot push keeps the review open, its text loaded, and an in-flight decision locked on the card and in the sheet', async () => {
     let finish: () => void = () => {};
     const client = proposalClient(

@@ -21,6 +21,12 @@ type Log = (level: LogLevel, msg: string, fields?: Record<string, unknown>) => v
  * journal file named in the entry header. */
 export const DREAM_PROMPT_BODY_CLAMP = 4_000;
 
+/** The overview the prompt asks for, and the most the owner's card shows:
+ * a longer one is cut at a word with a visible "…" (it is display text —
+ * the lessons themselves are never shortened here). */
+export const OVERVIEW_PROMPT_CHARS = 160;
+export const OVERVIEW_MAX_CHARS = 240;
+
 /** The supervised-slot surface the distiller needs. */
 export interface DistillerSlot {
   ensure(): Promise<AgentHandle>;
@@ -117,6 +123,9 @@ export function renderDreamPrompt(input: DreamPromptInput): string {
     '  that motivated the move; its old ids cannot travel. If no entry',
     '  motivates keeping a lesson, do not invent a citation — let it go;',
     '  the owner reviews what retirement removes.',
+    '- OVERVIEW: also write "overview": ONE plain-English sentence for the',
+    `  owner (at most ${OVERVIEW_PROMPT_CHARS} characters) saying what this update teaches`,
+    '  minions — no slugs, journal ids, file names or jargon.',
     `- Chapters are capped at ${input.chapterCapBytes} bytes; the index at`,
     `  ${input.indexCapBytes} bytes and must be able to list every chapter —`,
     '  consolidate overlapping chapters instead of growing the book.',
@@ -125,7 +134,8 @@ export function renderDreamPrompt(input: DreamPromptInput): string {
     input.outputFile,
     '',
     'Schema:',
-    '{"chapters":[{"slug":"kebab-case","title":"...","summary":"one line",',
+    '{"overview":"one plain sentence for the owner",',
+    '"chapters":[{"slug":"kebab-case","title":"...","summary":"one line",',
     '"tags":["..."],"lessons":[{"slug":"kebab-case",',
     '"body":"the lesson","tags":["..."],"journalIds":["j-1"],',
     '"mergeInto":"existing-lesson-slug (optional)"}]}]}',
@@ -162,7 +172,20 @@ export function parseDreamOutput(raw: string, entries: readonly JournalEntry[]):
   const chapters: ProposedChapter[] = chaptersRaw.map((value, index) =>
     parseProposedChapter(value, index, known),
   );
-  return { chapters };
+  const overview = parseOverview((parsed as Record<string, unknown>)['overview']);
+  return { chapters, ...(overview !== undefined ? { overview } : {}) };
+}
+
+/** The optional one-sentence overview: absent stays absent; anything but a
+ * non-empty string is a malformed output; whitespace runs collapse to one
+ * space so the card shows one line. */
+function parseOverview(value: unknown): string | undefined {
+  if (value === undefined) return undefined;
+  const text = requireString(value, 'overview').replace(/\s+/gu, ' ').trim();
+  if (text.length <= OVERVIEW_MAX_CHARS) return text;
+  const cut = text.slice(0, OVERVIEW_MAX_CHARS - 1);
+  const space = cut.lastIndexOf(' ');
+  return `${(space > OVERVIEW_MAX_CHARS / 2 ? cut.slice(0, space) : cut).trimEnd()}…`;
 }
 
 function requireObject(value: unknown, where: string): Record<string, unknown> {

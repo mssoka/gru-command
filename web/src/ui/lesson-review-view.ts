@@ -52,7 +52,19 @@ export function lessonStoryText(review: LessonProposalView): string {
   );
 }
 
-/** The coloured counts: new, reworded, removed, cut short, new chapters. */
+/** Gru's one-sentence summary as Gru talking (the brain coin and butter
+ * bubble of the FOR YOU look), or null when the update carries none. */
+export function lessonOverview(review: LessonProposalView): HTMLElement | null {
+  const overview = review.overview ?? null;
+  if (overview === null || overview.trim() === '') return null;
+  const row = el('div', 'board-lessons__overview');
+  const bubble = el('div', 'board-notification__gru-bubble board-lessons__overview-text');
+  bubble.append(el('span', 'board-notification__gru-label', 'Gru: '), overview);
+  row.append(el('span', 'board-notification__gru-coin', '🧠'), bubble);
+  return row;
+}
+
+/** The coloured counts: new, updated, removed, cut short, new chapters. */
 export function lessonTally(analysis: ProposalAnalysis): HTMLElement {
   const tally = el('div', 'board-lessons__tally');
   const chip = (tone: string, text: string, count: number): void => {
