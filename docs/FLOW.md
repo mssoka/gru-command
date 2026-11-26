@@ -1379,7 +1379,10 @@ machine:
 - `gru roll` (CLI; `dist/cli/service.js`, also the `gru` / `gru-service`
   bin) — wait mode follows the roll to verified completion; `--detach`
   follows it through preflight only, for a caller inside the service.
-- `POST /api/roll` (operator-guarded, pairing token).
+- `POST /api/roll` (operator-guarded, pairing token). The board's
+  **Update Now** button posts `{"mode":"update","now":true}`: `now` skips the
+  drain (see below), as a terminal `gru update` does, and the page follows
+  `GET /api/roll` until the relaunched service marks the record `done`.
 
 A roll has a mode. `update` (the default) is the path below. `restart`
 (`gru restart`, `{"mode":"restart"}`, #463) relaunches the build already on
@@ -1398,6 +1401,10 @@ idempotent phases:
    instance port** (owner incident 2026-09-23: a loopback squatter would
    make the post-swap `/health` verification read the wrong process —
    the roll fails loud + action-required before any pull/build);
+   `git fetch`, then **refuse an update whose incoming commits change the
+   service unit** (`install/launchd`, `install/systemd`): a roll relaunches
+   the unit already installed, and only `gru update` from a terminal can
+   rewrite it, so the refusal names that command and nothing is pulled;
    `git pull --ff-only` (divergence refuses,
    never resets); `npm ci` + `npm run build` + `npm run build:web` while
    the OLD process keeps serving (the build replaces files under `dist/`;
@@ -1411,7 +1418,9 @@ idempotent phases:
    swap. Deadline reached → the in-flight work is logged, recorded as
    `abandoned` in the roll record, and the swap proceeds; startup recovery
    terminalizes interrupted rounds INCOMPLETE and resumes interrupted
-   turns (#42).
+   turns (#42). A `now` roll (the board's Update Now button) has a bound of
+   zero: one probe records what is in flight as `abandoned`, the swap
+   follows at once, and the record carries `now: true`.
 3. **swap** — re-check the target SHA, write `<data_dir>/roll-marker.json`
    (the built SHA), then exit with code **75**. The marker is the only
    handoff state — no launchctl/systemctl juggling, no TTY.

@@ -87,6 +87,11 @@ export interface RollState {
   readonly phase: RollPhase;
   /** Absent on records written before #463, which were all updates. */
   readonly mode?: RollMode;
+  /** True when the roll skipped the drain, as a terminal `gru update` does:
+   * the swap follows preflight at once, work still in flight is cut (it is
+   * recorded in `drain.abandoned`) and boot recovery resumes it. Absent =
+   * the roll waited up to the drain bound. */
+  readonly now?: boolean;
   readonly reason: string | null;
   readonly requestedBy: string;
   readonly repoRoot: string;

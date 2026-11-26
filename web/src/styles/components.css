@@ -400,6 +400,62 @@ body {
   border-radius: 4px;
 }
 
+/* The Update Now button and its progress (owner request 2026-11-26): one
+   press runs what a terminal gru update runs. Its slot sits before the
+   readings, never inside them, so a laptop-width pill that cuts the
+   readings off ("deploy 3 behind…") never cuts the button off too. */
+.command-health__update-slot {
+  flex: none;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.command-health__update-slot[hidden] {
+  display: none;
+}
+
+/* A pp-btn (filled accent, square-ish corners, drop shadow), never
+   chip-shaped, so it reads as a button beside the flag pills (owner:
+   "can't tell that it's a button"); only its size is compacted for the
+   bar. */
+.pp-btn.command-health__update {
+  flex: none;
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  /* No taller than the bar's other lines (a 30px button added a row's
+     worth of height to the phone's sticky bar). */
+  padding: 1px 10px;
+  border-radius: 8px;
+  font-size: 12px;
+  line-height: 1.2;
+  white-space: nowrap;
+}
+
+.command-health__update-icon {
+  font-size: 13px;
+}
+
+.command-health__update:focus-visible {
+  outline: 3px solid var(--work);
+  outline-offset: 2px;
+}
+
+.command-health__update-status {
+  font-size: 12px;
+  font-weight: 700;
+  overflow-wrap: anywhere;
+}
+
+.command-health__update-status--work {
+  color: var(--ink);
+}
+
+.command-health__update-status--alert {
+  color: var(--band-needs-you-ink);
+}
+
 .command-health__part + .command-health__part::before {
   content: '·';
   margin: 0 6px;

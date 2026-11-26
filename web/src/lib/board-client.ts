@@ -24,6 +24,7 @@ import {
   type TranscriptPage,
   type TranscriptSearchResult,
 } from './board-protocol.js';
+import { parseRollReply, type RollView } from './board-update.js';
 
 export interface ReceiptPage {
   readonly receipts: readonly NotificationView[];
@@ -588,6 +589,32 @@ export class BoardClient {
     });
     if (!res.ok) return this.refused(path, res);
     return res.blob();
+  }
+
+  /** The Update button (board-update.ts): ask the service to update itself
+   * the way a terminal `gru update` does — no drain wait. Resolves with the
+   * accepted update's record (202), or with the record of the update
+   * already running (409), which the caller follows instead. */
+  async startUpdate(): Promise<{ readonly roll: RollView; readonly alreadyRunning: boolean }> {
+    const path = '/api/roll';
+    const doFetch = this.fetchImpl;
+    const res = await doFetch(path, {
+      method: 'POST',
+      headers: {
+        authorization: `Bearer ${this.options.token}`,
+        'content-type': 'application/json',
+      },
+      body: JSON.stringify({ mode: 'update', now: true, requested_by: 'board' }),
+    });
+    if (res.status !== 202 && res.status !== 409) return this.refused(path, res);
+    const roll = parseRollReply(await res.json());
+    if (roll === null) throw new Error(`the update reply (HTTP ${res.status}) carries no update record`);
+    return { roll, alreadyRunning: res.status === 409 };
+  }
+
+  /** The service's update record (null before its first update). */
+  async rollState(): Promise<RollView | null> {
+    return parseRollReply(await this.api<unknown>('/api/roll'));
   }
 
   private async postApi(path: string, body: unknown): Promise<unknown> {

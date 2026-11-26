@@ -114,6 +114,20 @@ agent-owned shell), where `launchctl unload`/`load` would kill the
 updater before it could reload the unit. Design, phases, drain bounds,
 and rollback safety: [FLOW.md](./FLOW.md#self-roll-the-service-deploys-itself).
 
+The board's **Update Now** button runs the same update from the browser. It
+appears on the deploy reading whenever that reading flags (a newer
+release, or the build is behind main). One press is a self-roll with
+`now: true`: the service pulls and rebuilds while it keeps serving, then
+restarts at once, without the drain wait, as `gru update` from a terminal
+does. Turns still running are cut, and boot recovery resumes them. The
+deploy reading shows each step, and the page reloads into the new board
+when the relaunched service reports the update done. A refusal (a dirty
+deploy clone, a failed build) shows its reason there, and the old build
+keeps serving. A self-roll cannot rewrite the service unit, so an update
+whose commits change `install/launchd` or `install/systemd` is refused
+before anything is pulled, with a note to run `gru update` in a terminal.
+That refusal applies to `gru roll` and `POST /api/roll` too.
+
 macOS (launchd):
 
 ```bash

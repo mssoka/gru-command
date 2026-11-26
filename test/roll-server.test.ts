@@ -162,6 +162,28 @@ describe('POST /api/roll', () => {
     }
   });
 
+  it('forwards now: true (the board Update button: no drain wait) and refuses a now that is not a boolean', async () => {
+    const harness = await boot({});
+    try {
+      const post = (body: unknown) => fetch(`http://127.0.0.1:${harness.port}/api/roll`, {
+        method: 'POST',
+        headers: { ...AUTH, 'content-type': 'application/json' },
+        body: JSON.stringify(body),
+      });
+      expect((await post({ now: true, requested_by: 'board' })).status).toBe(202);
+      expect(harness.invoked).toEqual([{ now: true, requestedBy: 'board' }]);
+      // now: false is the default wait, so nothing is forwarded for it.
+      expect((await post({ now: false })).status).toBe(202);
+      expect(harness.invoked[1]).toEqual({});
+      const stringy = await post({ now: 'yes' });
+      expect(stringy.status).toBe(400);
+      expect(((await stringy.json()) as { detail: string }).detail).toContain('now must be a boolean');
+      expect(harness.invoked).toHaveLength(2);
+    } finally {
+      await harness.close();
+    }
+  });
+
   it('answers 409 with the live record while a roll is already running', async () => {
     const live = rollState('drain', 'roll-live');
     const harness = await boot({

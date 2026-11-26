@@ -607,6 +607,165 @@ describe('board — cockpit health pill and KPI cards (cockpit rework)', () => {
     expect(verify?.querySelector('.command-health__flag')?.textContent).toBe('2 QUEUED');
   });
 
+  it('the deploy reading\'s Update button runs gru update in the background: no wait, follows it, reloads when the new build is up', async () => {
+    vi.useFakeTimers();
+    try {
+      const requests: { method: string; path: string; body: unknown; auth: string | null }[] = [];
+      const record = (rollId: string, phase: string) => ({ schemaVersion: 1, rollId, phase, toSha: 'b'.repeat(40), error: null });
+      // What GET /api/roll answers, one per read: the record from before the
+      // press, then the update's own record through the restart.
+      const reads: (object | 'down')[] = [record('roll-old', 'done'), record('roll-new', 'swap'), 'down', record('roll-new', 'done')];
+      const json = (status: number, body: unknown) =>
+        new Response(JSON.stringify(body), { status, headers: { 'content-type': 'application/json' } });
+      const fetchImpl = (async (input: string | URL | Request, init?: RequestInit) => {
+        const method = init?.method ?? 'GET';
+        const headers = new Headers(init?.headers);
+        requests.push({ method, path: String(input), body: init?.body === undefined ? null : JSON.parse(String(init.body)), auth: headers.get('authorization') });
+        if (method === 'POST') return json(202, { status: 'accepted', roll: record('roll-new', 'preflight') });
+        const next = reads.shift() ?? record('roll-new', 'done');
+        if (next === 'down') throw new TypeError('Failed to fetch');
+        return json(200, { roll: next });
+      }) as typeof fetch;
+      const client = new BoardClient({ token: 'board-token', host: 'gc.test', fetchImpl }, { connection: () => {}, snapshot: () => {}, fatal: () => {} });
+      const view = new BoardView(() => {});
+      const reloads: string[] = [];
+      view.setReloadHandler(() => reloads.push('reload'));
+      const behind = snapshot({
+        build: {
+          buildRev: 'a'.repeat(40),
+          buildCommittedAt: new Date(Date.now() - 6 * 3_600_000).toISOString(),
+          originMainRev: 'b'.repeat(40),
+          originMainCommittedAt: new Date().toISOString(),
+          commitsBehind: 2,
+          latestTag: null,
+          buildTag: null,
+          updateAvailable: null,
+          checkedAt: new Date().toISOString(),
+          checkError: null,
+        },
+      });
+      view.render(behind);
+      const slot = () => document.querySelector<HTMLElement>('#command-health .command-health__update-slot')!;
+      // No client, no button: the press would have nowhere to go, and the
+      // empty slot takes no room.
+      expect(slot().querySelector('.command-health__update')).toBeNull();
+      expect(slot().hidden).toBe(true);
+      // Bound, but the snapshot on screen is last-known until the client's
+      // own arrives: a last-known board authorizes no action.
+      view.bindClient(client);
+      expect(slot().querySelector('.command-health__update')).toBeNull();
+      view.render(behind);
+      const button = slot().querySelector<HTMLButtonElement>('.command-health__update')!;
+      expect(button.textContent).toBe('↻Update Now');
+      // Its own slot right after the summary, never inside the readings: a
+      // laptop-width pill cuts the readings off, and the button with them.
+      expect(button.closest('#command-health-parts')).toBeNull();
+      expect(slot().nextElementSibling?.id).toBe('command-health-parts');
+      // The accessible name starts with the visible label (voice control).
+      expect(button.getAttribute('aria-label')?.startsWith('Update Now:')).toBe(true);
+      // A real button (pp-btn: filled, shadowed), not one of the pills beside it.
+      expect(button.classList.contains('pp-btn')).toBe(true);
+      expect(button.classList.contains('pp-chip')).toBe(false);
+      expect(button.querySelector('.command-health__update-icon')?.getAttribute('aria-hidden')).toBe('true');
+      expect(button.getAttribute('aria-label')).toContain('as gru update does');
+
+      button.click();
+      await vi.advanceTimersByTimeAsync(0);
+      expect(requests.map(({ method, path }) => `${method} ${path}`)).toEqual(['GET /api/roll', 'POST /api/roll']);
+      expect(requests[1]).toMatchObject({ body: { mode: 'update', now: true, requested_by: 'board' }, auth: 'Bearer board-token' });
+      const status = () => slot().querySelector('.command-health__update-status')?.textContent;
+      expect(status()).toBe('updating: pulling and building…');
+      expect(slot().querySelector('.command-health__update')).toBeNull();
+
+      await vi.advanceTimersByTimeAsync(2_000);
+      expect(status()).toBe('restarting…');
+      await vi.advanceTimersByTimeAsync(2_000);
+      expect(status()).toBe('restarting — waiting for the service…');
+      // The restart drops the board's socket: the progress stays on the
+      // last-known board, and no button comes back meanwhile.
+      view.markSnapshotStale();
+      expect(status()).toBe('restarting — waiting for the service…');
+      expect(slot().querySelector('.command-health__update')).toBeNull();
+      expect(reloads).toEqual([]);
+      await vi.advanceTimersByTimeAsync(2_000);
+      expect(status()).toBe('updated — reloading…');
+      expect(reloads).toEqual(['reload']);
+      // Done: nothing polls after the reload.
+      await vi.advanceTimersByTimeAsync(10_000);
+      expect(requests).toHaveLength(5);
+    } finally {
+      vi.clearAllTimers();
+      vi.useRealTimers();
+    }
+  });
+
+  it('the Update button shows the refusal and offers itself again; an update already running is followed; no answer starts nothing', async () => {
+    vi.useFakeTimers();
+    try {
+      const json = (status: number, body: unknown) =>
+        new Response(JSON.stringify(body), { status, headers: { 'content-type': 'application/json' } });
+      let post: () => Response = () => json(503, { error: 'not_configured', detail: 'no pairing token configured' });
+      let getDown = false;
+      const posts: string[] = [];
+      const fetchImpl = (async (_input: string | URL | Request, init?: RequestInit) => {
+        if (init?.method === 'POST') {
+          posts.push('POST');
+          return post();
+        }
+        if (getDown) throw new TypeError('Failed to fetch');
+        return json(200, { roll: null });
+      }) as typeof fetch;
+      const client = new BoardClient({ token: 'board-token', host: 'gc.test', fetchImpl }, { connection: () => {}, snapshot: () => {}, fatal: () => {} });
+      const view = new BoardView(() => {});
+      view.setReloadHandler(() => {});
+      const release = snapshot({
+        build: {
+          buildRev: 'a'.repeat(40),
+          buildCommittedAt: null,
+          originMainRev: 'b'.repeat(40),
+          originMainCommittedAt: null,
+          commitsBehind: 0,
+          latestTag: 'v1.0.3',
+          buildTag: 'v1.0.2',
+          updateAvailable: true,
+          checkedAt: new Date().toISOString(),
+          checkError: null,
+        },
+      });
+      view.bindClient(client);
+      view.render(release);
+      const slot = () => document.querySelector<HTMLElement>('#command-health .command-health__update-slot')!;
+      const status = () => slot().querySelector('.command-health__update-status')?.textContent;
+
+      slot().querySelector<HTMLButtonElement>('.command-health__update')!.click();
+      await vi.advanceTimersByTimeAsync(0);
+      expect(status()).toBe('update failed: no pairing token configured');
+      expect(slot().querySelector('.command-health__update-status--alert')).not.toBeNull();
+      expect(slot().querySelector('.command-health__update')).not.toBeNull();
+
+      // A terminal gru update is already running: the page follows it.
+      post = () => json(409, { error: 'roll_in_progress', roll: { schemaVersion: 1, rollId: 'roll-cli', phase: 'drain', toSha: null, error: null } });
+      slot().querySelector<HTMLButtonElement>('.command-health__update')!.click();
+      await vi.advanceTimersByTimeAsync(0);
+      expect(status()).toBe('restarting…');
+      expect(slot().querySelector('.command-health__update')).toBeNull();
+
+      // A re-pair drops the follow (it may be another service), so the
+      // button comes back; with the service unreachable, nothing is posted.
+      view.bindClient(client);
+      view.render(release);
+      getDown = true;
+      const before = posts.length;
+      slot().querySelector<HTMLButtonElement>('.command-health__update')!.click();
+      await vi.advanceTimersByTimeAsync(0);
+      expect(status()).toBe('update failed: the service did not answer, so no update was started');
+      expect(posts).toHaveLength(before);
+    } finally {
+      vi.clearAllTimers();
+      vi.useRealTimers();
+    }
+  });
+
   it('renders an available release as the deploy alert with its tag and flag', () => {
     const view = new BoardView(() => {});
     view.render(

@@ -71,6 +71,17 @@ import {
   type SectionId,
 } from '../lib/board-sections.js';
 import { cockpitCards, gruQueueLine, healthPill, isQuietCard, type CockpitCard } from '../lib/cockpit.js';
+import {
+  UPDATE_BUTTON_TITLE,
+  UPDATE_FOLLOW_TIMEOUT_MS,
+  UPDATE_IDLE,
+  UPDATE_POLL_MS,
+  UPDATE_TIMED_OUT_DETAIL,
+  followRoll,
+  lostContact,
+  updateControl,
+  type UpdateFollow,
+} from '../lib/board-update.js';
 import { BOARD_WORDS, heistCount, megaminionCount } from '../lib/board-vocabulary.js';
 import { familyStatusBreakdown, isLiveMegaminion, subMinionTree } from '../lib/board-family.js';
 import { formatAge } from '../lib/board-time.js';
@@ -116,6 +127,13 @@ const ROUTING_LABEL: Readonly<Record<NotificationView['routing'], string>> = {
   'action-required': 'NEEDS GRU',
   'needs-owner': 'FOR YOU',
 };
+
+/** Why the Update button's request was refused: the server's own reason,
+ * or `noAnswer` when the request got none. */
+function updateRefusal(error: unknown, noAnswer: string): string {
+  if (!(error instanceof BoardApiError)) return noAnswer;
+  return error.detail ?? error.code ?? `HTTP ${error.status}`;
+}
 
 /** Truthful lens progress for whole-PR rounds: show what actually ran —
  * including lenses that ran and failed — and name unused lenses instead of
@@ -300,6 +318,14 @@ export class BoardView {
   /** Bumped on every re-pair: work started for an older client never
    * changes state, re-renders, or posts through the new one. */
   private clientGeneration = 0;
+  /** The Update button (board-update.ts): the update this page started
+   * and is following, its poll timer and its follow deadline. Reset on
+   * re-pair: a new pairing may be another service. */
+  private updateFollow: UpdateFollow = UPDATE_IDLE;
+  private updateTimer: ReturnType<typeof setTimeout> | null = null;
+  private updateDeadline = 0;
+  /** Reloads the page into the new board once the update is done. */
+  private reloadPage: () => void = () => location.reload();
   /** Toast + browser-notification surface (E7). */
   private onToast: ((notification: NotificationView) => void) | null = null;
   private snapshot: BoardSnapshot | null = null;
@@ -427,6 +453,11 @@ export class BoardView {
     this.onToast = handler;
   }
 
+  /** Tests replace the page reload that follows a finished update. */
+  setReloadHandler(handler: () => void): void {
+    this.reloadPage = handler;
+  }
+
   /** E7: bind the board client (receipts + acks) — rebound on re-pair.
    * Receipt paging is per-connection state: a re-pair must not surface the
    * previous server's fetched receipts or resume its pagination cursor. */
@@ -434,6 +465,8 @@ export class BoardView {
     this.boardClient = client;
     this.clientGeneration += 1;
     this.resetMedia();
+    this.stopUpdateFollow();
+    this.updateFollow = UPDATE_IDLE;
     this.socketLost = false;
     for (const [id, state] of this.proposalStates) {
       if (state.pendingDecision === null) {
@@ -1489,7 +1522,126 @@ export class BoardView {
       }
       this.healthParts.append(node);
     }
+    this.renderUpdateControl(snapshot);
     this.renderTrackerChips(snapshot);
+  }
+
+  /** The Update Now button and its progress (owner request 2026-11-26):
+   * one press runs what a terminal `gru update` runs. It lives in its own
+   * slot before the readings, never inside them: a laptop-width pill cuts
+   * the readings off ("deploy 3 behind…"), and the button went with them. */
+  private renderUpdateControl(snapshot: BoardSnapshot): void {
+    let slot = this.healthMount.querySelector<HTMLElement>('.command-health__update-slot');
+    if (slot === null) {
+      slot = el('span', 'command-health__update-slot');
+      this.healthParts.before(slot);
+    }
+    const control = updateControl(this.updateFollow, snapshot.build ?? null);
+    // Offered only on a live board: a last-known snapshot authorizes no
+    // action, and a press could not reach the service anyway. The progress
+    // text stays, since an update's own restart drops the board's socket.
+    const offered = control.offer && this.boardClient !== null && !this.lastKnown();
+    slot.dataset.update = this.updateFollow.step;
+    slot.replaceChildren();
+    slot.hidden = control.status === null && !offered;
+    if (control.status !== null) {
+      const status = el('span', `command-health__update-status command-health__update-status--${control.tone ?? 'work'}`, control.status);
+      status.setAttribute('role', 'status');
+      slot.append(status);
+    }
+    if (!offered) return;
+    const button = document.createElement('button');
+    button.type = 'button';
+    // A pp-btn (filled, shadowed), so it never reads as one of the pills.
+    button.className = 'pp-btn command-health__update';
+    const icon = el('span', 'command-health__update-icon', '↻');
+    icon.setAttribute('aria-hidden', 'true');
+    button.append(icon, document.createTextNode('Update Now'));
+    button.title = UPDATE_BUTTON_TITLE;
+    button.setAttribute('aria-label', UPDATE_BUTTON_TITLE);
+    button.dataset.actionId = 'deploy-update';
+    button.addEventListener('click', () => this.startUpdate());
+    slot.append(button);
+  }
+
+  private setUpdateFollow(next: UpdateFollow): void {
+    this.updateFollow = next;
+    if (this.snapshot !== null) this.renderHealth(this.snapshot);
+  }
+
+  private stopUpdateFollow(): void {
+    if (this.updateTimer !== null) clearTimeout(this.updateTimer);
+    this.updateTimer = null;
+  }
+
+  private startUpdate(): void {
+    const client = this.boardClient;
+    if (client === null || this.updateFollow.step === 'starting' || this.updateFollow.step === 'running') return;
+    const generation = this.clientGeneration;
+    this.updateDeadline = Date.now() + UPDATE_FOLLOW_TIMEOUT_MS;
+    this.setUpdateFollow({ step: 'starting', previousRollId: null });
+    void (async () => {
+      // The record before the press, so a POST that gets no answer is never
+      // followed onto an older update. No answer here: nothing was started.
+      let previousRollId: string | null;
+      try {
+        previousRollId = (await client.rollState())?.rollId ?? null;
+      } catch (error) {
+        if (generation !== this.clientGeneration) return;
+        this.setUpdateFollow({ step: 'failed', detail: updateRefusal(error, 'the service did not answer, so no update was started') });
+        return;
+      }
+      if (generation !== this.clientGeneration) return;
+      this.updateFollow = { step: 'starting', previousRollId };
+      try {
+        // 202: our update. 409: one already running (a terminal gru
+        // update, another tab), which this page follows instead.
+        const { roll } = await client.startUpdate();
+        if (generation !== this.clientGeneration) return;
+        this.advanceUpdate(followRoll(this.updateFollow, roll), generation);
+      } catch (error) {
+        if (generation !== this.clientGeneration) return;
+        if (error instanceof BoardApiError) {
+          this.setUpdateFollow({ step: 'failed', detail: updateRefusal(error, '') });
+        } else {
+          // No answer: the update may have started. Follow the record.
+          this.advanceUpdate(lostContact(this.updateFollow), generation);
+        }
+      }
+    })();
+  }
+
+  /** Show the next step; keep polling while the update runs, reload once
+   * the relaunched service has marked it done. */
+  private advanceUpdate(next: UpdateFollow, generation: number): void {
+    this.setUpdateFollow(next);
+    this.stopUpdateFollow();
+    if (next.step === 'done') {
+      this.reloadPage();
+      return;
+    }
+    if (next.step !== 'running') return;
+    this.updateTimer = setTimeout(() => {
+      this.updateTimer = null;
+      void this.pollUpdate(generation);
+    }, UPDATE_POLL_MS);
+  }
+
+  private async pollUpdate(generation: number): Promise<void> {
+    const client = this.boardClient;
+    if (generation !== this.clientGeneration || client === null) return;
+    if (Date.now() > this.updateDeadline) {
+      this.setUpdateFollow({ step: 'failed', detail: UPDATE_TIMED_OUT_DETAIL });
+      return;
+    }
+    let next: UpdateFollow;
+    try {
+      next = followRoll(this.updateFollow, await client.rollState());
+    } catch {
+      next = lostContact(this.updateFollow);
+    }
+    if (generation !== this.clientGeneration) return;
+    this.advanceUpdate(next, generation);
   }
 
   /** The health pill's "details" control: created once beside the summary,
