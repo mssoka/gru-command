@@ -72,6 +72,13 @@
   --font-body: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
 
   --ease-pop: cubic-bezier(0.34, 1.56, 0.64, 1);
+
+  /* Book of Lessons review diff (owner redesign 2026-11-26): new words
+     green, removed words red and struck — readable ink on each tint. */
+  --diff-ins-bg: #c6f1cc;
+  --diff-ins-ink: #14532d;
+  --diff-del-bg: #ffd3d8;
+  --diff-del-ink: #8f2433;
 }
 
 .dark {
@@ -117,4 +124,9 @@
   --shadow-card: 5px 6px 0 rgba(0, 0, 0, 0.35);
   --shadow-btn: 3px 4px 0 rgba(0, 0, 0, 0.4);
   --shadow-btn-pressed: 1px 2px 0 rgba(0, 0, 0, 0.4);
+
+  --diff-ins-bg: rgba(111, 214, 138, 0.26);
+  --diff-ins-ink: #c9f7d3;
+  --diff-del-bg: rgba(255, 143, 156, 0.22);
+  --diff-del-ink: #ffc2c9;
 }

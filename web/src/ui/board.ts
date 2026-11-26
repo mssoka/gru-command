@@ -23,7 +23,6 @@
 
 import {
   agentActivityOf,
-  ARCHIVED_LESSON_SLUG,
   agentRailBand,
   agentRuntimeOf,
   agentStateTone,
@@ -38,9 +37,7 @@ import {
   type AgentView,
   type BoardSnapshot,
   type JobView,
-  type LessonChangeView,
   type LessonProposalView,
-  type RemovedLessonView,
   type NotificationView,
   type PipelineEntryView,
   type RoundView,
@@ -152,6 +149,16 @@ import { BoardApiError, type BoardClient, type BoardConnectionState, type BoardS
 import type { StorageLike } from '../theme.js';
 import { DECISION_LABELS, decisionChipTone } from './decisions-status.js';
 import { el, mustGet } from './dom.js';
+import { analyseProposal, plural, proposalHeadline } from '../lib/lesson-review.js';
+import {
+  LESSON_FILTERS,
+  filterCounts,
+  lessonChanges,
+  lessonChecks,
+  lessonStoryText,
+  lessonTally,
+  type LessonFilter,
+} from './lesson-review-view.js';
 import { captureLabel, openCaptureViewer, type CaptureViewerHandle } from './media-viewer.js';
 import { RepoOverviewPanel } from './repo-overview.js';
 
@@ -315,6 +322,9 @@ export class BoardView {
    * fetched review, in-flight decision, last refusal). Pruned when the
    * proposal leaves FOR YOU; cleared on re-pair. */
   private readonly proposalStates = new Map<string, ProposalRowState>();
+  /** The review sheet (one modal dialog, made on first open): which
+   * proposal it shows and the state its content was drawn from. */
+  private lessonSheet: { readonly dialog: HTMLDialogElement; forId: string | null; key: string | null } | null = null;
   /** Bumped on every re-pair: work started for an older client never
    * changes state, re-renders, or posts through the new one. */
   private clientGeneration = 0;
@@ -550,7 +560,6 @@ export class BoardView {
     state.loadFailed = false;
     if (state.recorded === null && !preservePendingDecision) state.message = null;
     state.open = false;
-    state.nested.clear();
   }
 
   private renderSnapshot(snapshot: BoardSnapshot, source: BoardSnapshotSource | 'local' = 'local'): void {
@@ -590,6 +599,7 @@ export class BoardView {
     const ownerFocus = captureOwnerFocusKey(this.ownerMount);
     this.currentSections = null; // one fresh derivation per render
     this.renderOwnerActions(effective);
+    this.syncLessonSheet();
     this.renderHealth(effective);
     this.renderKpis(effective);
     this.renderNav(effective);
@@ -928,34 +938,13 @@ export class BoardView {
         recorded: null,
         message: null,
         loadFailed: false,
-        nested: new Set(),
+        filter: 'all',
+        actions: null,
       };
       this.proposalStates.set(item.id, state);
     }
     const current = state;
     const focusBase = `owner-proposal:${item.id}`;
-    const node = el('article', 'board-owner__row board-owner__row--proposal');
-    node.dataset.proposalId = item.id;
-    node.append(
-      el('div', 'board-owner__title', `📖 ${item.title}`),
-      el('div', 'board-owner__meta lbl', `${formatTs(item.ts)} · owner decision owed`),
-    );
-    if (item.detail !== null && item.detail !== '') {
-      // Prose stays readable prose: only the short metadata line wears the
-      // uppercase label treatment (R1 blocker: the detail went through .lbl).
-      node.append(el('div', 'board-owner__context', item.detail));
-    }
-    node.append(el('div', 'board-owner__consequence', row.consequence));
-    const review = document.createElement('details');
-    review.className = 'board-owner__review';
-    const summary = document.createElement('summary');
-    summary.textContent = 'Review changes';
-    summary.dataset.ownerFocusKey = `${focusBase}:review`;
-    const body = el('div', 'board-owner__review-body');
-    if (current.review !== null) body.replaceChildren(renderProposalReview(current.review, current.nested, focusBase));
-    else body.textContent = current.loading !== null ? 'loading…' : 'not loaded — close and reopen to retry';
-    review.append(summary, body);
-    review.open = current.open;
     const generation = this.clientGeneration;
     const live = (): boolean => generation === this.clientGeneration;
     const load = (): Promise<LessonProposalView> => {
@@ -1027,39 +1016,6 @@ export class BoardView {
       );
       return current.loading;
     };
-    summary.addEventListener('click', (event) => {
-      if (!this.snapshotIsCurrent && !current.open) event.preventDefault();
-    });
-    review.addEventListener('toggle', () => {
-      // A stale row may keep an already-open review readable, but it cannot
-      // start a new fetch against the newly bound or reconnecting client.
-      const wasOpen = current.open;
-      if (!this.snapshotIsCurrent && review.open && !wasOpen) {
-        review.open = false;
-        return;
-      }
-      // Restoring an open disclosure on re-render (which also fires toggle)
-      // must never refetch in a loop.
-      current.open = review.open;
-      if (review.open && !wasOpen) void load().catch(() => {});
-    });
-    const actions = el('div', 'board-owner__actions');
-    const accept = document.createElement('button');
-    accept.type = 'button';
-    accept.className = 'board-owner__ack board-owner__accept';
-    accept.dataset.actionId = row.actionId;
-    accept.dataset.ownerFocusKey = `${focusBase}:accept`;
-    const reject = document.createElement('button');
-    reject.type = 'button';
-    reject.className = 'board-owner__ack board-owner__reject';
-    reject.dataset.ownerFocusKey = `${focusBase}:reject`;
-    accept.textContent = current.inFlight === 'accept' ? 'accepting…' : 'Accept';
-    reject.textContent = current.inFlight === 'reject' ? 'rejecting…' : 'Reject';
-    // A recorded decision can only be finished, never flipped.
-    accept.disabled = !this.snapshotIsCurrent || current.inFlight !== null || current.recorded === 'reject' ||
-      (current.pendingDecision !== null && current.pendingDecision !== 'accept');
-    reject.disabled = !this.snapshotIsCurrent || current.inFlight !== null || current.recorded === 'accept' ||
-      (current.pendingDecision !== null && current.pendingDecision !== 'reject');
     /** An unconfirmed decision (#277): the cached proposal metadata may be
      * stale — the server may have recorded the choice and lost only the
      * reply. Reload it; the FETCHED durable decision (never the choice
@@ -1178,17 +1134,287 @@ export class BoardView {
           if (!provenNotApplied && !decidedElsewhere) reconcile(uncertain);
         });
     };
-    accept.addEventListener('click', () => decide('accept'));
-    reject.addEventListener('click', () => decide('reject'));
-    actions.append(accept, reject);
-    node.append(review, actions);
+    current.actions = {
+      decide,
+      load: () => {
+        void load().catch(() => {});
+      },
+    };
+    // The card shows what KIND of change this is (counts, things to check)
+    // before the owner opens anything, so an untouched proposal reads its
+    // review as soon as it is on a live board. A failed read waits for the
+    // owner's next open; after any decision attempt only the decision path
+    // reads again (its outcome must never be overwritten by a fresh read).
+    if (
+      this.snapshotIsCurrent && current.review === null && current.loading === null && !current.loadFailed &&
+      current.message === null && current.recorded === null && current.pendingDecision === null && current.inFlight === null
+    ) {
+      void load().catch(() => {});
+    }
+    const node = this.lessonProposalCard(row, current, focusBase);
+    if (current.open) this.renderLessonSheet(item.id, current);
+    if (bandVisible) this.sendShown(item, 'web-board');
+    return node;
+  }
+
+  /** The FOR YOU card of a lesson proposal (owner look A, 2026-11-20; owner
+   * redesign 2026-11-26): a coral strip with a plain headline, the counts
+   * and "Things to check" on the left, the owner's call on the right —
+   * See what changes, Accept all, Reject all. */
+  private lessonProposalCard(row: OwnerProposalRow, current: ProposalRowState, focusBase: string): HTMLElement {
+    const item = row.notification;
+    const review = current.review;
+    const analysis = review === null ? null : analyseProposal(review);
+    const node = el('article', 'board-owner__row board-owner__row--proposal board-lessons');
+    node.dataset.proposalId = item.id;
+    const strip = el('header', 'board-lessons__strip');
+    strip.append(
+      el('span', 'pp-chip board-lessons__kind', '📖 Book of Lessons'),
+      el('div', 'board-owner__title board-lessons__headline', analysis === null ? item.title : proposalHeadline(analysis)),
+      el('span', 'board-owner__meta lbl board-lessons__when', `${formatTs(item.ts)} · owner decision owed`),
+    );
+    const body = el('div', 'board-lessons__body');
+    const story = el('div', 'board-lessons__story');
+    if (review === null || analysis === null) {
+      // Not read yet (or the read failed): the notice's own words.
+      if (item.detail !== null && item.detail !== '') story.append(el('div', 'board-owner__context board-lessons__context', item.detail));
+      if (current.loading !== null) story.append(el('div', 'board-lessons__quiet', 'Reading the changes…'));
+      else if (current.loadFailed) story.append(el('div', 'board-lessons__quiet', 'The changes could not be read yet: “See what changes” tries again.'));
+    } else {
+      story.append(el('div', 'board-owner__context board-lessons__context', lessonStoryText(review)), lessonTally(analysis), lessonChecks(analysis));
+    }
+    const call = el('div', 'board-lessons__call');
+    call.append(el('div', 'lbl board-lessons__kicker', 'Your call'), el('div', 'board-lessons__question', 'Write these changes into the Book of Lessons?'));
+    const see = el('button', 'board-lessons__see', 'See what changes →');
+    see.type = 'button';
+    see.dataset.ownerFocusKey = `${focusBase}:review`;
+    see.disabled = !this.snapshotIsCurrent && !current.open;
+    see.addEventListener('click', () => this.openLessonSheet(item.id));
+    const choices = el('div', 'board-lessons__choices');
+    const buttons = this.lessonDecisionButtons(current, row.actionId, `${focusBase}`);
+    const acceptTile = el('div', 'board-lessons__choice board-lessons__choice--accept');
+    acceptTile.append(buttons.accept);
+    const rejectTile = el('div', 'board-lessons__choice');
+    rejectTile.append(buttons.reject);
+    if (review !== null && analysis !== null) {
+      acceptTile.append(el(
+        'div',
+        'board-lessons__consequence',
+        `Writes ${analysis.changes === 1 ? 'the 1 change' : `all ${analysis.changes} changes`}. Minions get them from their next job.`,
+      ));
+      rejectTile.append(el(
+        'div',
+        'board-lessons__consequence',
+        `Keeps the book as it is; these ${plural(review.entries, 'journal note')} won’t be proposed again.`,
+      ));
+    }
+    choices.append(acceptTile, rejectTile);
+    // Not read yet: the static copy says what each choice does.
+    if (review === null) choices.append(el('div', 'board-lessons__consequence board-lessons__consequence--both', row.consequence));
+    call.append(see, choices);
+    body.append(story, call);
+    node.append(strip, body);
     if (current.message !== null) {
-      const message = el('div', 'board-owner__error', current.message);
+      const message = el('div', 'board-owner__error board-lessons__message', current.message);
       message.setAttribute('role', 'alert');
       node.append(message);
     }
-    if (bandVisible) this.sendShown(item, 'web-board');
     return node;
+  }
+
+  /** Accept all / Reject all for one surface (the card or the sheet): the
+   * same locks everywhere — a recorded decision can only be finished,
+   * never flipped, and an in-flight one locks both. */
+  private lessonDecisionButtons(
+    current: ProposalRowState,
+    actionId: string | null,
+    focusBase: string,
+  ): { readonly accept: HTMLButtonElement; readonly reject: HTMLButtonElement } {
+    const accept = document.createElement('button');
+    accept.type = 'button';
+    accept.className = 'board-owner__accept board-lessons__accept';
+    if (actionId !== null) accept.dataset.actionId = actionId;
+    accept.dataset.ownerFocusKey = `${focusBase}:accept`;
+    const reject = document.createElement('button');
+    reject.type = 'button';
+    reject.className = 'board-owner__reject board-lessons__reject';
+    reject.dataset.ownerFocusKey = `${focusBase}:reject`;
+    accept.textContent = current.inFlight === 'accept' ? 'accepting…' : '✓ Accept all';
+    reject.textContent = current.inFlight === 'reject' ? 'rejecting…' : '✕ Reject all';
+    accept.disabled = !this.snapshotIsCurrent || current.inFlight !== null || current.recorded === 'reject' ||
+      (current.pendingDecision !== null && current.pendingDecision !== 'accept');
+    reject.disabled = !this.snapshotIsCurrent || current.inFlight !== null || current.recorded === 'accept' ||
+      (current.pendingDecision !== null && current.pendingDecision !== 'reject');
+    accept.addEventListener('click', () => current.actions?.decide('accept'));
+    reject.addEventListener('click', () => current.actions?.decide('reject'));
+    return { accept, reject };
+  }
+
+  /** Open the review sheet over the board (a modal dialog: the review needs
+   * the whole width, and Accept all / Reject all stay in reach at its
+   * foot). A stale board cannot start a new read. */
+  private openLessonSheet(id: string): void {
+    const current = this.proposalStates.get(id);
+    if (current === undefined) return;
+    if (!this.snapshotIsCurrent && !current.open) return;
+    current.open = true;
+    // A failed read is retried by the owner's open.
+    if (current.review === null && current.loading === null) current.actions?.load();
+    this.renderLessonSheet(id, current);
+  }
+
+  private closeLessonSheet(restoreFocus = true): void {
+    const sheet = this.lessonSheet;
+    if (sheet === null) return;
+    const id = sheet.forId;
+    sheet.forId = null;
+    sheet.key = null;
+    if (id !== null) {
+      const current = this.proposalStates.get(id);
+      if (current !== undefined) current.open = false;
+    }
+    if (sheet.dialog.open) sheet.dialog.close();
+    sheet.dialog.replaceChildren();
+    if (restoreFocus && id !== null) {
+      const see = [...this.ownerMount.querySelectorAll<HTMLElement>('[data-owner-focus-key]')].find(
+        (node) => node.dataset.ownerFocusKey === `owner-proposal:${id}:review`,
+      );
+      see?.focus();
+    }
+  }
+
+  /** Close the sheet when its proposal is gone or no longer open (decided,
+   * a re-pair, a stale board): run after every owner render. */
+  private syncLessonSheet(): void {
+    const sheet = this.lessonSheet;
+    if (sheet === null || sheet.forId === null) return;
+    const current = this.proposalStates.get(sheet.forId);
+    if (current === undefined || !current.open) this.closeLessonSheet(current !== undefined);
+  }
+
+  /** (Re)draw the sheet's content — only when something it shows changed,
+   * so a live push never resets its scroll, its filter or the control in
+   * focus. */
+  private renderLessonSheet(id: string, current: ProposalRowState): void {
+    let sheet = this.lessonSheet;
+    if (sheet === null || !sheet.dialog.isConnected) {
+      const dialog = document.createElement('dialog');
+      dialog.className = 'board-lessons-sheet';
+      dialog.setAttribute('aria-labelledby', 'board-lessons-sheet-title');
+      dialog.addEventListener('cancel', (event) => {
+        // Esc closes through the same path as the Close button.
+        event.preventDefault();
+        this.closeLessonSheet();
+      });
+      (document.getElementById('board-view') ?? document.body).append(dialog);
+      sheet = { dialog, forId: null, key: null };
+      this.lessonSheet = sheet;
+    }
+    if (sheet.forId !== null && sheet.forId !== id) {
+      const other = this.proposalStates.get(sheet.forId);
+      if (other !== undefined) other.open = false;
+    }
+    const key = JSON.stringify([
+      id,
+      current.loadGeneration,
+      current.review === null ? (current.loading !== null ? 'loading' : current.loadFailed ? 'failed' : 'none') : current.review.id,
+      current.filter,
+      current.inFlight,
+      current.recorded,
+      current.pendingDecision,
+      current.decisionSubmitting,
+      current.message,
+      this.snapshotIsCurrent,
+    ]);
+    const dialog = sheet.dialog;
+    if (sheet.forId === id && sheet.key === key && dialog.open) return;
+    const scroller = dialog.querySelector<HTMLElement>('.board-lessons-sheet__body');
+    const scrollTop = sheet.forId === id ? (scroller?.scrollTop ?? 0) : 0;
+    const active = document.activeElement;
+    const focusKey = active instanceof HTMLElement && dialog.contains(active) ? (active.dataset.sheetFocus ?? null) : null;
+    sheet.forId = id;
+    sheet.key = key;
+    dialog.replaceChildren(this.lessonSheetContent(id, current));
+    if (!dialog.open) {
+      if (typeof dialog.showModal === 'function') dialog.showModal();
+      else dialog.setAttribute('open', '');
+    }
+    const body = dialog.querySelector<HTMLElement>('.board-lessons-sheet__body');
+    if (body !== null && scrollTop > 0) body.scrollTop = scrollTop;
+    if (focusKey !== null) dialog.querySelector<HTMLElement>(`[data-sheet-focus="${CSS.escape(focusKey)}"]`)?.focus();
+  }
+
+  private lessonSheetContent(id: string, current: ProposalRowState): HTMLElement {
+    const review = current.review;
+    const analysis = review === null ? null : analyseProposal(review);
+    const frame = el('div', 'board-lessons-sheet__frame');
+    const top = el('div', 'board-lessons-sheet__top');
+    const titleRow = el('div', 'board-lessons-sheet__title-row');
+    const title = el('h2', 'board-lessons-sheet__title', `📖 ${analysis === null ? 'Book of Lessons update' : proposalHeadline(analysis)}`);
+    title.id = 'board-lessons-sheet-title';
+    const close = el('button', 'board-lessons-sheet__close', '✕ Close');
+    close.type = 'button';
+    close.dataset.sheetFocus = 'close';
+    close.addEventListener('click', () => this.closeLessonSheet());
+    titleRow.append(title, close);
+    top.append(titleRow);
+    const body = el('div', 'board-lessons-sheet__body');
+    if (review === null || analysis === null) {
+      if (current.loading !== null) body.append(el('div', 'board-lessons__quiet', 'Reading the changes…'));
+      else if (!current.loadFailed) body.append(el('div', 'board-lessons__quiet', 'The board is refreshing.'));
+      else {
+        body.append(el('div', 'board-lessons__quiet', 'The changes could not be read.'));
+        const retry = el('button', 'board-lessons__retry', 'Try again');
+        retry.type = 'button';
+        retry.dataset.sheetFocus = 'retry';
+        retry.addEventListener('click', () => current.actions?.load());
+        body.append(retry);
+      }
+    } else {
+      top.append(lessonTally(analysis));
+      const counts = filterCounts(review);
+      const filters = el('div', 'board-lessons-sheet__filters');
+      filters.setAttribute('role', 'group');
+      filters.setAttribute('aria-label', 'Show');
+      for (const filter of LESSON_FILTERS) {
+        const count = counts[filter.id];
+        if (filter.id !== 'all' && count === 0) continue;
+        const chip = el('button', 'board-lessons-sheet__filter', `${filter.label} · ${count}`);
+        chip.type = 'button';
+        chip.dataset.sheetFocus = `filter:${filter.id}`;
+        chip.dataset.filter = filter.id;
+        chip.setAttribute('aria-pressed', String(current.filter === filter.id));
+        chip.addEventListener('click', () => {
+          current.filter = filter.id;
+          this.renderLessonSheet(id, current);
+        });
+        filters.append(chip);
+      }
+      top.append(filters);
+      body.append(lessonChanges(review, current.filter));
+    }
+    const foot = el('div', 'board-lessons-sheet__foot');
+    const hint = el(
+      'div',
+      'board-lessons-sheet__hint',
+      review === null
+        ? 'Accept all writes every change; Reject all keeps the book as it is.'
+        : `From ${plural(review.entries, 'journal note')}. Accept all writes every change above; Reject all keeps the book as it is.`,
+    );
+    foot.append(hint);
+    if (current.message !== null) {
+      const message = el('div', 'board-owner__error board-lessons-sheet__message', current.message);
+      message.setAttribute('role', 'alert');
+      foot.append(message);
+    }
+    const actions = el('div', 'board-lessons-sheet__actions');
+    const buttons = this.lessonDecisionButtons(current, null, `sheet:${id}`);
+    buttons.accept.dataset.sheetFocus = 'accept';
+    buttons.reject.dataset.sheetFocus = 'reject';
+    actions.append(buttons.accept, buttons.reject);
+    foot.append(actions);
+    frame.append(top, body, foot);
+    return frame;
   }
 
   /** The bell's copy of a lesson proposal is a pointer, not a control
@@ -1216,7 +1442,7 @@ export class BoardView {
         this.rerenderOwner();
       }
       const target = document.querySelector<HTMLElement>(`#board-owner [data-proposal-id="${CSS.escape(item.id)}"]`);
-      const landing = target?.querySelector<HTMLElement>('.board-owner__review > summary') ?? null;
+      const landing = target?.querySelector<HTMLElement>('.board-lessons__see') ?? null;
       if (target === null || landing === null) {
         // Nothing to land on (already decided): focus never stays inside
         // the hidden panel.
@@ -4009,8 +4235,11 @@ interface ProposalRowState {
   message: string | null;
   /** The message is a failed review load (cleared by a successful retry). */
   loadFailed: boolean;
-  /** Open nested "before" disclosures, by chapter/lesson key. */
-  nested: Set<string>;
+  /** Which lessons the review sheet shows. */
+  filter: LessonFilter;
+  /** The latest render's decide/load (their closures carry the client
+   * generation), so the sheet's buttons act exactly like the card's. */
+  actions: { readonly decide: (decision: 'accept' | 'reject') => void; readonly load: () => void } | null;
 }
 
 /** ONE decision submission, shared by every surface that renders the
@@ -4162,142 +4391,3 @@ function describeDecisionFailure(error: unknown, recorded: 'accept' | 'reject' |
   return `Couldn’t confirm the decision (${reason}) — it may or may not have been recorded. The board is refreshing; check the book or retry.`;
 }
 
-const tagsLine = (tags: readonly string[]): string => tags.join(', ') || '—';
-
-/** The owner's review of a lesson proposal: per chapter, every change the
- * Accept would make — title, summary and tag changes, new and updated
- * lessons with their exact text (the prior text one click away), every
- * lesson that would disappear — and every INDEX entry it changes. */
-function renderProposalReview(proposal: LessonProposalView, nested: Set<string>, focusBase: string): HTMLElement {
-  const root = el('div', 'board-owner__review-list');
-  root.append(
-    el(
-      'div',
-      'lbl',
-      `distilled from ${proposal.entries} journal entr${proposal.entries === 1 ? 'y' : 'ies'} (through #${proposal.throughSeq})`,
-    ),
-  );
-  if (proposal.chapters.length === 0 && proposal.index.length === 0) root.append(el('div', 'lbl', 'no chapter changes'));
-  for (const chapter of proposal.chapters) {
-    const section = el('section', 'board-owner__review-chapter');
-    if (chapter.retired) {
-      section.append(
-        el(
-          'div',
-          'board-owner__review-heading',
-          `${chapter.title.after} — chapter retired (${chapter.removed.length} lesson${chapter.removed.length === 1 ? '' : 's'} removed)`,
-        ),
-      );
-      // What the retirement takes away beyond the lessons.
-      if (chapter.summary.before !== null && chapter.summary.before !== '') {
-        section.append(el('div', 'lbl board-owner__review-meta', `summary removed: ${chapter.summary.before}`));
-      }
-      if (chapter.tags.before.length > 0) {
-        section.append(el('div', 'lbl board-owner__review-meta', `tags removed: ${tagsLine(chapter.tags.before)}`));
-      }
-    } else {
-      const heading =
-        chapter.title.before === null
-          ? `${chapter.title.after} — new chapter`
-          : chapter.title.before !== chapter.title.after
-            ? `${chapter.title.before} → ${chapter.title.after} (renamed)`
-            : chapter.title.after;
-      section.append(el('div', 'board-owner__review-heading', heading));
-      if (chapter.summary.before !== chapter.summary.after) {
-        section.append(
-          el(
-            'div',
-            'lbl board-owner__review-meta',
-            chapter.summary.before === null
-              ? `summary: ${chapter.summary.after}`
-              : `summary: ${chapter.summary.before} → ${chapter.summary.after}`,
-          ),
-        );
-      }
-      if (chapter.tags.before.join('\u0000') !== chapter.tags.after.join('\u0000')) {
-        section.append(el('div', 'lbl board-owner__review-meta', `tags: ${tagsLine(chapter.tags.before)} → ${tagsLine(chapter.tags.after)}`));
-      }
-    }
-    for (const lesson of chapter.added) section.append(reviewLesson(`new · recurred ${lesson.recurred}`, lesson, chapter.slug, nested, focusBase));
-    for (const lesson of chapter.changed) {
-      const recurrence = lesson.previousRecurred !== null && lesson.previousRecurred !== lesson.recurred
-        ? `recurred ${lesson.previousRecurred} → ${lesson.recurred}`
-        : `recurred ${lesson.recurred}`;
-      section.append(reviewLesson(`updated · ${recurrence}`, lesson, chapter.slug, nested, focusBase));
-    }
-    for (const lesson of chapter.removed) section.append(reviewRemoved(lesson));
-    const notes: string[] = [];
-    if (chapter.provenanceTrimmed > 0) notes.push(`${chapter.provenanceTrimmed} oldest journal handle(s) released to fit`);
-    if (chapter.bodiesTrimmed > 0) notes.push(`${chapter.bodiesTrimmed} lesson(s) trimmed to fit`);
-    if (notes.length > 0) section.append(el('div', 'lbl', notes.join(' · ')));
-    root.append(section);
-  }
-  if (proposal.index.length > 0) {
-    const section = el('section', 'board-owner__review-chapter');
-    section.append(el('div', 'board-owner__review-heading', 'INDEX.md (what briefings see)'));
-    for (const entry of proposal.index) {
-      const line =
-        entry.before === null
-          ? `+ ${entry.slug}: ${entry.after!.summary} (tags: ${tagsLine(entry.after!.tags)})`
-          : entry.after === null
-            ? `− ${entry.slug}: ${entry.before.summary} (tags: ${tagsLine(entry.before.tags)})`
-            : `~ ${entry.slug}: ${entry.before.summary} (tags: ${tagsLine(entry.before.tags)}) → ${entry.after.summary} (tags: ${tagsLine(entry.after.tags)})`;
-      section.append(el('div', 'board-owner__review-text', line));
-    }
-    root.append(section);
-  }
-  return root;
-}
-
-/** How the review names a record: the archive record says what it is. */
-function reviewName(slug: string): string {
-  return slug === ARCHIVED_LESSON_SLUG ? 'archive record (journal handles of dropped lessons)' : slug;
-}
-
-function reviewLesson(label: string, lesson: LessonChangeView, chapterSlug: string, nested: Set<string>, focusBase: string): HTMLElement {
-  const node = el('div', 'board-owner__review-lesson');
-  node.append(
-    el('div', 'lbl board-owner__review-label', `${label} · ${reviewName(lesson.slug)}`),
-    el('div', 'board-owner__review-text', lesson.body),
-  );
-  if (lesson.previousTags === null) {
-    if (lesson.tags.length > 0) node.append(el('div', 'lbl board-owner__review-meta', `tags: ${lesson.tags.join(', ')}`));
-  } else if (lesson.previousTags.join('\u0000') !== lesson.tags.join('\u0000')) {
-    node.append(el('div', 'lbl board-owner__review-meta', `tags: ${tagsLine(lesson.previousTags)} → ${tagsLine(lesson.tags)}`));
-  }
-  if (lesson.previousBody !== null && lesson.previousBody !== lesson.body) {
-    const key = `${chapterSlug}/${lesson.slug}`;
-    const before = document.createElement('details');
-    const toggle = document.createElement('summary');
-    toggle.textContent = 'before';
-    toggle.dataset.ownerFocusKey = `${focusBase}:before:${key}`;
-    before.append(toggle, el('div', 'board-owner__review-text board-owner__review-text--before', lesson.previousBody));
-    before.open = nested.has(key);
-    before.addEventListener('toggle', () => {
-      if (before.open) nested.add(key);
-      else nested.delete(key);
-    });
-    node.append(before);
-  }
-  return node;
-}
-
-const REMOVED_LABEL: Readonly<Record<RemovedLessonView['reason'], string>> = {
-  cap: 'removed to fit the cap',
-  retired: 'removed with the chapter',
-  discarded: 'new, but left out to fit the cap',
-};
-
-function reviewRemoved(lesson: RemovedLessonView): HTMLElement {
-  const node = el('div', 'board-owner__review-lesson board-owner__review-lesson--removed');
-  node.append(
-    el(
-      'div',
-      'lbl board-owner__review-label',
-      `${REMOVED_LABEL[lesson.reason]} · ${reviewName(lesson.slug)} (recurred ${lesson.recurred})`,
-    ),
-    el('div', 'board-owner__review-text', lesson.body),
-  );
-  if (lesson.tags.length > 0) node.append(el('div', 'lbl board-owner__review-meta', `tags: ${tagsLine(lesson.tags)}`));
-  return node;
-}

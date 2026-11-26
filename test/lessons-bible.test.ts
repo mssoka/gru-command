@@ -24,10 +24,11 @@ import {
   parseIndex,
   renderIndex,
   serializeChapter,
+  TRIM_MARKER,
 } from '../src/lessons/bible.js';
 import { JournalStore } from '../src/lessons/journal.js';
 import { createBibleReferences } from '../src/lessons/references.js';
-import { ARCHIVED_LESSON_SLUG as WEB_ARCHIVED_LESSON_SLUG } from '../web/src/lib/board-protocol.js';
+import { ARCHIVED_LESSON_SLUG as WEB_ARCHIVED_LESSON_SLUG, LESSON_TRIM_MARKER as WEB_LESSON_TRIM_MARKER } from '../web/src/lib/board-protocol.js';
 import { ARCHIVED_LESSON_SLUG, BibleError, type BibleChapter, type ProposedChapter, type ProvenanceRef } from '../src/lessons/types.js';
 import type { BiblePlan } from '../src/lessons/bible.js';
 
@@ -1693,6 +1694,8 @@ describe('fifth review round of #253 — follow-up (bmad-code-review, 2026-10-08
 
   it('the archive record is reviewed like any record — its arrival, a change to its text, and its removal (C5)', () => {
     expect(WEB_ARCHIVED_LESSON_SLUG).toBe(ARCHIVED_LESSON_SLUG);
+    // The board shows a cut lesson as cut by this marker: the two must agree.
+    expect(WEB_LESSON_TRIM_MARKER).toBe(TRIM_MARKER);
     const archiveBody = 'Lessons trimmed at the chapter cap; provenance retained so the journal remains the ground truth.';
     // The cap drops a lesson: the archive record it creates is listed.
     const keep = lessonOf('keep', [{ id: 'j-2', ts: at(2) }], 'K'.repeat(150));

@@ -3587,60 +3587,106 @@ describe('FOR YOU owner band (permanent, top of board)', () => {
       wake: ReturnType<typeof vi.fn>;
     };
   }
-  function openReview(): void {
-    const details = document.getElementById('board-owner')!.querySelector<HTMLDetailsElement>('.board-owner__review')!;
-    details.open = true;
-    details.dispatchEvent(new Event('toggle'));
+  /** "See what changes": the review opens in a sheet over the board. */
+  function openReview(): HTMLDialogElement {
+    document.getElementById('board-owner')!.querySelector<HTMLButtonElement>('.board-lessons__see')!.click();
+    return document.querySelector<HTMLDialogElement>('dialog.board-lessons-sheet')!;
   }
+  const reviewSheet = (): HTMLDialogElement | null => document.querySelector<HTMLDialogElement>('dialog.board-lessons-sheet');
+  /** Each lesson card in the sheet, as the owner reads it. */
+  const lessonCards = () =>
+    [...reviewSheet()!.querySelectorAll<HTMLElement>('.board-lessons__lesson')].map((node) => ({
+      kind: node.dataset.lessonKind,
+      badges: [...node.querySelectorAll('.board-lessons__badge')].map((badge) => badge.textContent),
+      name: node.querySelector('.board-lessons__lesson-name')?.textContent,
+      why: node.querySelector('.board-lessons__why')?.textContent,
+      added: [...node.querySelectorAll('.board-lessons__text ins')].map((part) => part.textContent),
+      removed: [...node.querySelectorAll('.board-lessons__text del')].map((part) => part.textContent),
+      text: node.querySelector('.board-lessons__text')?.textContent,
+      labels: node.querySelector('.board-lessons__labels')?.textContent ?? null,
+    }));
+  /** One-line changes (descriptions, table-of-contents lines, renames) under a chapter heading. */
+  const chapterLines = (slug: string) =>
+    [...reviewSheet()!.querySelectorAll<HTMLElement>(`[data-chapter="${slug}"] .board-lessons__chapter-head > .board-lessons__line, [data-chapter="${slug}"] .board-lessons__chapter-head > .board-lessons__labels`)]
+      .map((line) => line.textContent);
 
-  it('lesson proposal row: Review shows the exact text; a decision stays pending until the snapshot resolves it', async () => {
+  it('lesson proposal row: the card says what kind of change, the sheet shows the exact text; a decision stays pending until the snapshot resolves it', async () => {
     const client = proposalClient(decided);
     const view = new BoardView(() => {}, client);
     view.render(snapshot({ notifications: [proposalNotice] }));
     const band = document.getElementById('board-owner')!;
     expect(band.querySelector('.board-band__count')?.textContent).toBe('1 pending');
+    // Until the review is read, the static copy says what each choice does.
     expect(band.textContent).toContain('Accept writes these changes into the Book of Lessons');
-    // No generic Ack on the proposal row: the real controls are the
-    // review disclosure and Accept/Reject (the action-id family is
+    // No generic Ack on the proposal row: the real controls are the review
+    // and Accept all / Reject all (the action-id family is
     // `owner-proposal:<id>`).
-    expect(band.querySelector('.board-owner__ack.board-owner__accept')).not.toBeNull();
-    expect(band.querySelector('.board-owner__ack.board-owner__reject')).not.toBeNull();
+    expect(band.querySelector('.board-owner__accept')).not.toBeNull();
+    expect(band.querySelector('.board-owner__reject')).not.toBeNull();
     expect(band.querySelector('[data-action-id^="owner-ack:"]')).toBeNull();
-    openReview();
     await flush();
-    expect(band.textContent).toContain('Close the shell first.\nThen restart.');
-    expect(band.textContent).toContain('updated · recurred 2 → 3 · drain');
-    expect(band.textContent).toContain('4 oldest journal handle(s) released to fit');
+    // Read on its own: the card names the kind of change before anything is opened.
+    const card = band.querySelector<HTMLElement>('[data-proposal-id="lp-1"]')!;
+    expect(card.querySelector('.board-lessons__headline')?.textContent).toBe('Gru wants to add 1 lesson and update 1');
+    expect([...card.querySelectorAll('.board-lessons__count')].map((chip) => chip.textContent)).toEqual(['+ 1 new', '✎ 1 updated', '− 0 removed']);
+    expect(card.querySelector('.board-lessons__check')?.textContent).toBe('Nothing unusual: every change is a new lesson or an update.');
+    expect([card.querySelector('.board-owner__accept')?.textContent, card.querySelector('.board-owner__reject')?.textContent]).toEqual(['✓ Accept all', '✕ Reject all']);
+    const sheet = openReview();
+    expect(sheet.open).toBe(true);
+    expect(lessonCards()).toEqual([
+      { kind: 'new', badges: ['New'], name: 'Close shell', why: 'New · seen once.', added: [], removed: [], text: 'Close the shell first.\nThen restart.', labels: null },
+      {
+        kind: 'updated',
+        badges: ['Reworded'],
+        name: 'Drain',
+        why: 'Seen again, now 3 times. Mostly rewritten',
+        added: [' before a roll'],
+        removed: [],
+        text: 'Drain.',
+        labels: null,
+      },
+    ]);
+    // Mostly rewritten: before and after side by side, the new words marked.
+    expect([...sheet.querySelectorAll('.board-lessons__pair .board-lessons__side')].map((side) => side.textContent)).toEqual([
+      'BeforeDrain.',
+      'AfterDrain before a roll.',
+    ]);
+    expect(sheet.textContent).toContain('Housekeeping: 4 old source notes (which journal note a lesson came from) are dropped to save space.');
     band.querySelector<HTMLButtonElement>('[data-action-id="owner-proposal:lp-1"]')!.click();
     await flush();
     expect(client.decideLessonProposal).toHaveBeenCalledWith('prop-1', 'accept');
     expect(document.getElementById('board-owner')!.querySelector('[data-action-id="owner-proposal:lp-1"]')).not.toBeNull();
     view.render(snapshot({ notifications: [{ ...proposalNotice, resolvedAt: '2026-01-01T00:09:00.000Z' }] }));
     expect(document.getElementById('board-owner')!.querySelector('[data-action-id="owner-proposal:lp-1"]')).toBeNull();
+    // The snapshot that closes the row closes its review too.
+    expect(sheet.open).toBe(false);
     expect(client.getLessonProposal).toHaveBeenCalledTimes(1);
   });
 
-  it('a snapshot push keeps the review open, its text loaded, and an in-flight decision locked', async () => {
+  it('a snapshot push keeps the review open, its text loaded, and an in-flight decision locked on the card and in the sheet', async () => {
     let finish: () => void = () => {};
     const client = proposalClient(
       (id) => new Promise((resolve) => { finish = () => resolve({ id, decision: 'accepted' }); }),
     );
     const view = new BoardView(() => {}, client);
     view.render(snapshot({ notifications: [proposalNotice] }));
-    openReview();
+    const sheet = openReview();
     await flush();
-    document.getElementById('board-owner')!.querySelector<HTMLButtonElement>('.board-owner__accept')!.click();
+    sheet.querySelector<HTMLButtonElement>('.board-lessons-sheet__actions .board-owner__accept')!.click();
     await flush();
     // An unrelated push re-renders everything.
     view.render(snapshot({ notifications: [proposalNotice, notification('other', { routing: 'fyi' })] }));
     const band = document.getElementById('board-owner')!;
-    expect(band.querySelector<HTMLDetailsElement>('.board-owner__review')!.open).toBe(true);
-    expect(band.textContent).toContain('Close the shell first.');
-    const accept = band.querySelector<HTMLButtonElement>('.board-owner__accept')!;
-    expect([accept.textContent, accept.disabled]).toEqual(['accepting…', true]);
-    const reject = band.querySelector<HTMLButtonElement>('.board-owner__reject')!;
-    expect(reject.disabled).toBe(true);
-    reject.click();
+    expect(reviewSheet()).toBe(sheet);
+    expect(sheet.open).toBe(true);
+    expect(sheet.textContent).toContain('Close the shell first.');
+    for (const surface of [band, sheet]) {
+      const accept = surface.querySelector<HTMLButtonElement>('.board-owner__accept')!;
+      expect([accept.textContent, accept.disabled]).toEqual(['accepting…', true]);
+      const reject = surface.querySelector<HTMLButtonElement>('.board-owner__reject')!;
+      expect(reject.disabled).toBe(true);
+      reject.click();
+    }
     expect(client.decideLessonProposal).toHaveBeenCalledTimes(1);
     expect(client.getLessonProposal).toHaveBeenCalledTimes(1);
     finish();
@@ -3702,21 +3748,24 @@ describe('FOR YOU owner band (permanent, top of board)', () => {
     view.render(snapshot({ notifications: [proposalNotice] }));
     openReview();
     await flush();
-    const text = document.getElementById('board-owner')!.textContent ?? '';
-    expect(text).toContain('summary: Restart discipline. → Restart and roll discipline.');
-    expect(text).toContain('tags: ops → ops, roll');
-    expect(text).toContain('tags: — → roll');
-    expect(text).toContain('removed to fit the cap · drop-me');
-    expect(text).toContain('A lesson the cap removes.');
-    expect(text).toContain('Model policy — chapter retired (1 lesson removed)');
-    expect(text).toContain('removed with the chapter · sol-for-silas');
-    expect(text).not.toContain('dropped to fit');
+    expect(chapterLines('ops')).toEqual(['Description:Restart and roll discipline.', 'Chapter labels:+ roll']);
+    expect(reviewSheet()!.querySelector('[data-chapter="ops"] .board-lessons__line ins')?.textContent).toBe('and roll ');
+    expect(chapterLines('model-policy')).toEqual(['Description removed:Which model does what.', 'Labels:models']);
+    expect(reviewSheet()!.querySelector('[data-chapter="model-policy"] .board-lessons__badge')?.textContent).toBe('Chapter removed');
+    expect(lessonCards().map(({ kind, badges, name, why, text, labels }) => ({ kind, badges, name, why, text, labels }))).toEqual([
+      { kind: 'updated', badges: ['Seen again'], name: 'Drain', why: 'Same wording · Seen again, now twice. ', text: 'Drain before a roll.', labels: 'Labels:+ roll' },
+      { kind: 'removed', badges: ['Removed'], name: 'Drop me', why: 'Removed to make room: the chapter is full. Seen once before.', text: 'A lesson the cap removes.', labels: null },
+      { kind: 'removed', badges: ['Removed'], name: 'Sol for silas', why: 'Removed with its chapter. Seen once before.', text: 'Silas runs on Sol.', labels: null },
+    ]);
+    // The card warns about what goes before anything is opened.
+    const checks = [...document.getElementById('board-owner')!.querySelectorAll('.board-lessons__check-list li')].map((item) => item.textContent);
+    expect(checks).toEqual(['2 lessons would be removed.', 'A whole chapter would go: “Model policy”.']);
   });
 
   it('the archive record is explained wherever it appears — added, changed and removed — with its body and tags (R7-08)', async () => {
     const ARCHIVE = 'archived-provenance';
     const archiveBody = 'Lessons trimmed at the chapter cap; provenance retained so the journal remains the ground truth.';
-    const explained = 'archive record (journal handles of dropped lessons)';
+    const explained = 'Archive record (where dropped lessons came from)';
     const review = proposalReview({
       chapters: [
         {
@@ -3761,16 +3810,14 @@ describe('FOR YOU owner band (permanent, top of board)', () => {
     view.render(snapshot({ notifications: [proposalNotice] }));
     openReview();
     await flush();
-    const lessons = [...document.getElementById('board-owner')!.querySelectorAll<HTMLElement>('.board-owner__review-lesson')]
-      .map((node) => [...node.children].filter((child) => child.tagName === 'DIV').map((child) => child.textContent));
-    expect(lessons).toEqual([
-      [`new · recurred 1 · ${explained}`, archiveBody, 'tags: archived'],
-      ['removed to fit the cap · drop-me (recurred 1)', 'A lesson the cap removes.'],
-      [`updated · recurred 1 · ${explained}`, `${archiveBody} Merged.`, 'tags: archived → archived, rounds'],
-      [`removed with the chapter · ${explained} (recurred 2)`, archiveBody, 'tags: archived'],
+    expect(lessonCards().map(({ badges, name, text, labels }) => [badges, name, text, labels])).toEqual([
+      [['New'], explained, archiveBody, 'Labels:archived'],
+      [['Removed'], 'Drop me', 'A lesson the cap removes.', null],
+      [['Reworded'], explained, `${archiveBody} Merged.`, 'Labels:+ rounds'],
+      [['Removed'], explained, archiveBody, 'Labels:archived'],
     ]);
     // The internal slug never stands alone as a label.
-    expect(document.getElementById('board-owner')!.textContent).not.toMatch(new RegExp(`· ${ARCHIVE}\\b`));
+    expect(reviewSheet()!.textContent).not.toContain(ARCHIVE);
   });
 
   it('band Accept and band Reject reach the real client’s exact decision endpoints', async () => {
@@ -3791,19 +3838,19 @@ describe('FOR YOU owner band (permanent, top of board)', () => {
     await flush();
     expect(calls).toEqual(['GET /api/lessons/proposal', 'POST /api/lessons/proposal/prop-1/accept']);
     calls.length = 0;
-    const second = new BoardView(() => {}, client);
-    second.render(snapshot({ notifications: [{ ...proposalNotice, id: 'lp-2' }] }));
     const secondReview = { ...proposalReview(), id: 'prop-2', notificationId: 'lp-2' };
     (client as unknown as { getLessonProposal: () => Promise<unknown> }).getLessonProposal = async () => {
       calls.push('GET /api/lessons/proposal');
       return secondReview;
     };
+    const second = new BoardView(() => {}, client);
+    second.render(snapshot({ notifications: [{ ...proposalNotice, id: 'lp-2' }] }));
     document.getElementById('board-owner')!.querySelector<HTMLButtonElement>('.board-owner__reject')!.click();
     await flush();
     expect(calls).toEqual(['GET /api/lessons/proposal', 'POST /api/lessons/proposal/prop-2/reject']);
   });
 
-  it('the review names renames, new chapters, recurrence moves and every INDEX entry the Accept changes', async () => {
+  it('the review names renames, new chapters, recurrence moves and every table-of-contents entry the Accept changes', async () => {
     const review = proposalReview({
       chapters: [
         {
@@ -3835,22 +3882,34 @@ describe('FOR YOU owner band (permanent, top of board)', () => {
         { slug: 'fresh', before: null, after: { summary: 'Brand new.', tags: ['new'] } },
         { slug: 'gone', before: { summary: 'Old chapter.', tags: ['old'] }, after: null },
         { slug: 'untouched', before: { summary: 'Was this.', tags: ['a'] }, after: { summary: 'Now this.', tags: ['a', 'b'] } },
+        { slug: 'ops', before: { summary: 'Restart discipline.', tags: ['ops'] }, after: { summary: 'Restart disc…', tags: ['ops'] } },
       ],
     });
     const view = new BoardView(() => {}, proposalClient(decided, review));
     view.render(snapshot({ notifications: [proposalNotice] }));
     openReview();
     await flush();
-    const text = document.getElementById('board-owner')!.textContent ?? '';
-    expect(text).toContain('Ops → Operations (renamed)');
-    expect(text).toContain('Fresh ground — new chapter');
-    expect(text).toContain('summary: Brand new.');
-    expect(text).toContain('updated · recurred 3 → 4 · drain');
-    expect(text).toContain('new · recurred 1 · first');
-    expect(text).toContain('INDEX.md (what briefings see)');
-    expect(text).toContain('+ fresh: Brand new. (tags: new)');
-    expect(text).toContain('− gone: Old chapter.');
-    expect(text).toContain('~ untouched: Was this. (tags: a) → Now this. (tags: a, b)');
+    const sheet = reviewSheet()!;
+    expect(sheet.querySelector('[data-chapter="ops"] .board-lessons__chapter-name')?.textContent).toBe('Operations');
+    expect(sheet.querySelector('[data-chapter="ops"] .board-lessons__badge')?.textContent).toBe('Renamed');
+    // The table-of-contents line differs from the description (its cap cut it): shown, and flagged.
+    expect(chapterLines('ops')).toEqual(['Was called:Ops', 'Table of contents (used to match lessons to jobs):Restart discipline.disc…✂ cut short to fit']);
+    expect(sheet.querySelector('[data-chapter="fresh"] .board-lessons__badge')?.textContent).toBe('New chapter');
+    // The new chapter's own lines already say what its table-of-contents entry says.
+    expect(chapterLines('fresh')).toEqual(['Description:Brand new.', 'Chapter labels:+ new']);
+    expect(lessonCards().map(({ badges, name, why }) => [badges, name, why])).toEqual([
+      [['Seen again'], 'Drain', 'Same wording · Seen again, now 4 times. '],
+      [['New'], 'First', 'New · seen once.'],
+    ]);
+    const tocOnly = [...sheet.querySelectorAll('.board-lessons__chapter--toc .board-lessons__toc-entry')].map((entry) => entry.textContent);
+    expect(tocOnly).toEqual([
+      'GoneTable of contents (used to match lessons to jobs):Old chapter.Table-of-contents labels:old',
+      'UntouchedTable of contents (used to match lessons to jobs):WasNow this.Table-of-contents labels:+ b',
+    ]);
+    expect([...document.getElementById('board-owner')!.querySelectorAll('.board-lessons__check-list li')].map((item) => item.textContent)).toEqual([
+      'Renamed: “Ops” → “Operations”.',
+      '1 table-of-contents line minions read would be cut short (for example “Restart disc…”).',
+    ]);
   });
 
   it('a recorded-but-unfinished decision (202) says so and locks the opposite choice — a blocked one too', async () => {
@@ -3902,7 +3961,7 @@ describe('FOR YOU owner band (permanent, top of board)', () => {
     expect(client.wake).toHaveBeenCalledTimes(1);
   });
 
-  it('the review names what removals take away: tags, a retired chapter’s summary and tags, INDEX tags, left-out lessons', async () => {
+  it('the review names what removals take away: tags, a retired chapter’s summary and tags, left-out lessons', async () => {
     const review = proposalReview({
       chapters: [
         {
@@ -3936,31 +3995,41 @@ describe('FOR YOU owner band (permanent, top of board)', () => {
     view.render(snapshot({ notifications: [proposalNotice] }));
     openReview();
     await flush();
-    const text = document.getElementById('board-owner')!.textContent ?? '';
-    expect(text).toContain('summary removed: Which model does what.');
-    expect(text).toContain('tags removed: models, routing');
-    expect(text).toContain('removed with the chapter · sol-for-silas (recurred 2)');
-    expect(text).toContain('tags: silas');
-    expect(text).toContain('new, but left out to fit the cap · left-out (recurred 1)');
-    expect(text).toContain('21 oldest journal handle(s) released to fit');
-    expect(text).toContain('− model-policy: Which model does what. (tags: models, routing)');
+    // The retired chapter's description and labels go; its table-of-contents
+    // entry says the same, so it is not repeated.
+    expect(chapterLines('model-policy')).toEqual(['Description removed:Which model does what.', 'Labels:modelsrouting']);
+    expect(lessonCards().map(({ badges, name, why, labels }) => [badges, name, why, labels])).toEqual([
+      [['Removed'], 'Sol for silas', 'Removed with its chapter. Seen twice before.', 'Labels:silas'],
+      [['New'], 'Kept', 'New · seen once.', null],
+      [['Left out'], 'Left out', 'New, but left out: the chapter is full. Seen once.', 'Labels:cap'],
+    ]);
+    expect(reviewSheet()!.textContent).toContain('Housekeeping: 21 old source notes');
+    expect([...document.getElementById('board-owner')!.querySelectorAll('.board-lessons__check-list li')].map((item) => item.textContent)).toEqual([
+      '1 lesson would be removed.',
+      '1 new lesson is left out because the chapter is full.',
+      'A whole chapter would go: “Model policy”.',
+    ]);
   });
 
   it('the bell only points to For You — no review, no decision there; "Go to For You" lands on the band row', async () => {
     const client = proposalClient();
     const view = new BoardView(() => {}, client);
     view.render(snapshot({ notifications: [proposalNotice] }));
+    await flush();
+    const reads = client.getLessonProposal.mock.calls.length; // the band card's own read
     (document.getElementById('notification-bell') as HTMLButtonElement).click();
     const bell = document.getElementById('notification-list')!;
     const pointer = bell.querySelector('.board-owner__row--pointer')!;
     expect(pointer.textContent).toContain('Book of Lessons: 2 lesson changes proposed');
     expect(pointer.textContent).toContain('Review the changes and decide in FOR YOU');
     expect(pointer.querySelector('.board-owner__pointer-text')?.classList.contains('lbl')).toBe(false);
-    expect(bell.querySelector('.board-owner__accept, .board-owner__reject, .board-owner__review')).toBeNull();
+    expect(bell.querySelector('.board-owner__accept, .board-owner__reject, .board-lessons__see')).toBeNull();
     pointer.querySelector<HTMLButtonElement>('.board-owner__goto')!.click();
     expect(document.getElementById('notification-panel')!.hidden).toBe(true);
-    expect(document.activeElement).toBe(document.getElementById('board-owner')!.querySelector('.board-owner__review > summary'));
-    expect(client.getLessonProposal).not.toHaveBeenCalled();
+    expect(document.activeElement).toBe(document.getElementById('board-owner')!.querySelector('.board-lessons__see'));
+    await flush();
+    expect(client.getLessonProposal.mock.calls.length).toBe(reads);
+    expect(client.decideLessonProposal).not.toHaveBeenCalled();
   });
 
   it('proposal prose and the pointer are readable mixed-case text, never the uppercase label treatment (R1)', async () => {
@@ -3972,7 +4041,7 @@ describe('FOR YOU owner band (permanent, top of board)', () => {
     const view = new BoardView(() => {}, client);
     view.render(snapshot({ notifications: [detailed] }));
     const band = document.getElementById('board-owner')!;
-    // The detail is readable prose in its own readable class...
+    // Until the review is read, the detail is readable prose in its own readable class...
     const context = band.querySelector('.board-owner__context')!;
     expect(context.textContent).toContain('Two lessons changed');
     expect(context.classList.contains('lbl')).toBe(false);
@@ -3982,12 +4051,17 @@ describe('FOR YOU owner band (permanent, top of board)', () => {
     expect(meta.textContent).toContain('owner decision owed');
     expect(meta.textContent).not.toContain('Two lessons changed');
     // The consequence line stays readable prose too.
-    expect(band.querySelector('.board-owner__consequence')!.classList.contains('lbl')).toBe(false);
-    // The review body (the lesson text itself) is never uppercase/label-spaced.
-    openReview();
+    expect(band.querySelector('.board-lessons__consequence')!.classList.contains('lbl')).toBe(false);
+    // Read: the story, the checks and every consequence stay readable prose.
     await flush();
-    const reviewBody = band.querySelector('.board-owner__review-body')!;
+    for (const selector of ['.board-owner__context', '.board-lessons__check', '.board-lessons__consequence']) {
+      const node = band.querySelector(selector)!;
+      expect(node.classList.contains('lbl'), selector).toBe(false);
+    }
+    // The review body (the lesson text itself) is never uppercase/label-spaced.
+    const reviewBody = openReview().querySelector('.board-lessons-sheet__body')!;
     expect(reviewBody.classList.contains('lbl')).toBe(false);
+    expect(reviewBody.querySelector('.lbl')).toBeNull();
     expect(reviewBody.textContent).toContain('Close the shell first');
     // The real controls survive the readability fix.
     expect(band.querySelector('.board-owner__accept')).not.toBeNull();
@@ -4003,6 +4077,8 @@ describe('FOR YOU owner band (permanent, top of board)', () => {
     const client = proposalClient();
     const view = new BoardView(() => {}, client);
     view.render(snapshot({ notifications: [proposalNotice] }));
+    await flush();
+    const reads = client.getLessonProposal.mock.calls.length; // the band card's own read
     const bell = document.getElementById('notification-bell') as HTMLButtonElement;
     const panel = document.getElementById('notification-panel')!;
     panel.hidden = true; // as in the page: closed until the bell opens it
@@ -4025,11 +4101,11 @@ describe('FOR YOU owner band (permanent, top of board)', () => {
     expect(bell.dataset.open).toBe('false');
     expect(document.activeElement).toBe(bell); // never left inside the hidden panel
     await flush();
-    expect(client.getLessonProposal).not.toHaveBeenCalled();
+    expect(client.getLessonProposal.mock.calls.length).toBe(reads);
     expect(client.decideLessonProposal).not.toHaveBeenCalled();
   });
 
-  it('"Go to For You" reveals a proposal six newer obligations hid, and never fetches or decides (C3)', async () => {
+  it('"Go to For You" reveals a proposal six newer obligations hid, and never decides (C3)', async () => {
     const client = proposalClient();
     const view = new BoardView(() => {}, client);
     const older = { ...proposalNotice, ts: '2026-01-01T00:00:00.000Z' };
@@ -4038,14 +4114,17 @@ describe('FOR YOU owner band (permanent, top of board)', () => {
     view.render(snapshot({ notifications: [older, ...newer] }));
     const band = document.getElementById('board-owner')!;
     expect(band.querySelector('[data-proposal-id="lp-1"]')).toBeNull(); // behind the window
+    // A card behind the window reads nothing.
+    expect(client.getLessonProposal).not.toHaveBeenCalled();
     (document.getElementById('notification-bell') as HTMLButtonElement).click();
     document.getElementById('notification-list')!.querySelector<HTMLButtonElement>('.board-owner__goto')!.click();
     expect(document.getElementById('notification-panel')!.hidden).toBe(true);
     const row = band.querySelector('[data-proposal-id="lp-1"]');
     expect(row).not.toBeNull();
-    expect(document.activeElement).toBe(row!.querySelector('.board-owner__review > summary'));
+    expect(document.activeElement).toBe(row!.querySelector('.board-lessons__see'));
     await flush();
-    expect(client.getLessonProposal).not.toHaveBeenCalled();
+    // Revealed, the card reads its own review (to show its counts) — once.
+    expect(client.getLessonProposal).toHaveBeenCalledTimes(1);
     expect(client.decideLessonProposal).not.toHaveBeenCalled();
   });
 
@@ -4065,17 +4144,19 @@ describe('FOR YOU owner band (permanent, top of board)', () => {
     client.getLessonProposal.mockImplementationOnce(() => Promise.reject(new TypeError('fetch failed')));
     const view = new BoardView(() => {}, client);
     view.render(snapshot({ notifications: [proposalNotice] }));
-    openReview();
     await flush();
     expect(document.getElementById('board-owner')!.querySelector('[role="alert"]')?.textContent).toContain('Couldn’t load the proposal');
-    const details = document.getElementById('board-owner')!.querySelector<HTMLDetailsElement>('.board-owner__review')!;
-    details.open = false;
-    details.dispatchEvent(new Event('toggle'));
-    openReview();
+    // The failed read is not retried on its own (no loop on every push)...
+    view.render(snapshot({ notifications: [proposalNotice] }));
     await flush();
-    const band = document.getElementById('board-owner')!;
-    expect(band.textContent).toContain('Close the shell first.');
-    expect(band.querySelector('[role="alert"]')).toBeNull();
+    expect(client.getLessonProposal).toHaveBeenCalledTimes(1);
+    // ...the owner's open retries it.
+    const sheet = openReview();
+    await flush();
+    expect(client.getLessonProposal).toHaveBeenCalledTimes(2);
+    expect(sheet.textContent).toContain('Close the shell first.');
+    expect(document.getElementById('board-owner')!.querySelector('[role="alert"]')).toBeNull();
+    expect(document.getElementById('board-owner')!.querySelector('.board-lessons__tally')).not.toBeNull();
   });
 
   it('a review gone before this page loaded it is an unknown outcome through the real client — and the board refreshes', async () => {
@@ -4197,30 +4278,36 @@ describe('FOR YOU owner band (permanent, top of board)', () => {
     expect(band.textContent).toContain('Not applied — disk I/O error. A fresh proposal will follow.');
   });
 
-  it('an open "before" disclosure and the focused control survive a snapshot push', async () => {
+  it('the open review keeps its filter, its scroll and the focused control across a snapshot push; Close returns focus to the card', async () => {
     const view = new BoardView(() => {}, proposalClient(decided));
     view.render(snapshot({ notifications: [proposalNotice] }));
+    const sheet = openReview();
+    await flush();
+    const filter = (id: string): HTMLButtonElement => sheet.querySelector<HTMLButtonElement>(`[data-filter="${id}"]`)!;
+    expect([...sheet.querySelectorAll('[data-filter]')].map((chip) => chip.textContent)).toEqual(['All · 2', 'New · 1', 'Updated · 1']);
+    filter('updated').click();
+    expect(lessonCards().map(({ name }) => name)).toEqual(['Drain']);
+    expect(filter('updated').getAttribute('aria-pressed')).toBe('true');
+    filter('updated').focus();
+    const body = sheet.querySelector<HTMLElement>('.board-lessons-sheet__body')!;
+    body.scrollTop = 40;
+    const scrolledTo = body.scrollTop;
+    view.render(snapshot({ notifications: [proposalNotice, notification('other', { routing: 'fyi' })] }));
+    // Nothing the sheet shows changed: the same nodes, the same place.
+    expect(sheet.querySelector('.board-lessons-sheet__body')).toBe(body);
+    expect(body.scrollTop).toBe(scrolledTo);
+    expect(lessonCards().map(({ name }) => name)).toEqual(['Drain']);
+    expect(document.activeElement).toBe(filter('updated'));
+    // A change it shows (a lock) redraws it, keeping filter and focus.
+    view.markSnapshotStale();
+    view.render(snapshot({ notifications: [proposalNotice] }));
+    expect(sheet.open).toBe(false); // a stale board dropped the review it read
     openReview();
     await flush();
-    let band = document.getElementById('board-owner')!;
-    const before = [...band.querySelectorAll<HTMLDetailsElement>('.board-owner__review-lesson details')].find((node) =>
-      node.textContent?.includes('Drain.'),
-    )!;
-    before.open = true;
-    before.dispatchEvent(new Event('toggle'));
-    const toggle = before.querySelector<HTMLElement>('summary')!;
-    toggle.focus();
-    const key = toggle.dataset.ownerFocusKey;
-    expect(key).toContain(':before:ops/drain');
-    view.render(snapshot({ notifications: [proposalNotice, notification('other', { routing: 'fyi' })] }));
-    band = document.getElementById('board-owner')!;
-    const restored = [...band.querySelectorAll<HTMLDetailsElement>('.board-owner__review-lesson details')].find((node) =>
-      node.textContent?.includes('Drain.'),
-    )!;
-    expect(restored).not.toBe(before);
-    expect(restored.open).toBe(true);
-    expect((document.activeElement as HTMLElement | null)?.dataset.ownerFocusKey).toBe(key);
-    expect(document.activeElement).toBe(restored.querySelector('summary'));
+    expect(lessonCards().map(({ name }) => name)).toEqual(['Drain']);
+    sheet.querySelector<HTMLButtonElement>('.board-lessons-sheet__close')!.click();
+    expect(sheet.open).toBe(false);
+    expect(document.activeElement).toBe(document.getElementById('board-owner')!.querySelector('.board-lessons__see'));
   });
 
   it('a re-pair while the review is loading never sends the decision through either client', async () => {
@@ -4239,11 +4326,11 @@ describe('FOR YOU owner band (permanent, top of board)', () => {
     const staleReject = band.querySelector<HTMLButtonElement>('.board-owner__reject')!;
     expect(staleAccept.disabled).toBe(true);
     expect(staleReject.disabled).toBe(true);
-    const staleReview = band.querySelector<HTMLDetailsElement>('.board-owner__review')!;
-    staleReview.open = true;
-    staleReview.dispatchEvent(new Event('toggle'));
+    const staleSee = band.querySelector<HTMLButtonElement>('.board-lessons__see')!;
+    expect(staleSee.disabled).toBe(true);
+    staleSee.dispatchEvent(new Event('click', { bubbles: true }));
     await flush();
-    expect(staleReview.open).toBe(false);
+    expect(reviewSheet()?.open ?? false).toBe(false);
     expect(newClient.getLessonProposal).not.toHaveBeenCalled();
     staleAccept.dispatchEvent(new Event('click', { bubbles: true }));
     staleReject.dispatchEvent(new Event('click', { bubbles: true }));
@@ -4258,7 +4345,7 @@ describe('FOR YOU owner band (permanent, top of board)', () => {
     band = document.getElementById('board-owner')!;
     expect(band.querySelector('[role="alert"]')).toBeNull();
     const accept = band.querySelector<HTMLButtonElement>('.board-owner__accept')!;
-    expect([accept.textContent, accept.disabled]).toEqual(['Accept', false]);
+    expect([accept.textContent, accept.disabled]).toEqual(['✓ Accept all', false]);
     expect(newClient.markNotificationShown).toHaveBeenCalled();
   });
 
@@ -4377,21 +4464,26 @@ describe('FOR YOU owner band (permanent, top of board)', () => {
     expect(client.decideLessonProposal).toHaveBeenCalledTimes(1);
   });
 
-  it('the phone layout keeps the proposal review inside the single column', async () => {
+  it('the phone layout keeps the proposal card in one column and the review sheet full-screen', async () => {
     const { existsSync, readFileSync } = await import('node:fs');
     const { join } = await import('node:path');
     const file = [join(process.cwd(), 'src/styles/components.css'), join(process.cwd(), 'web/src/styles/components.css')].find((path) =>
       existsSync(path),
     )!;
     const css = readFileSync(file, 'utf8');
-    const phone = css.slice(css.indexOf('@media (max-width: 560px) {'));
-    const rule = /\.board-owner__row--proposal\s*\{([^}]*)\}/u.exec(phone.slice(0, phone.indexOf('\n}\n')))?.[1] ?? '';
-    expect(rule.replace(/\s+/gu, ' ')).toContain(
-      "grid-template-areas: 'title' 'meta' 'context' 'note' 'review' 'action' 'error';",
+    const compact = (block: string | undefined): string => (block ?? '').replace(/\s+/gu, ' ');
+    // The card's story and call stack when the surface cannot give each 320px.
+    expect(compact(/\.board-lessons__body\s*\{([^}]*)\}/u.exec(css)?.[1])).toContain(
+      'grid-template-columns: repeat(auto-fit, minmax(min(100%, max(320px, 40%)), 1fr));',
     );
+    // On a phone the review sheet takes the whole screen.
+    const narrowSheets = [...css.matchAll(/@media \(max-width: 560px\) \{\s*\.board-lessons-sheet\s*\{([^}]*)\}/gu)];
+    expect(narrowSheets).toHaveLength(1);
+    expect(compact(narrowSheets[0]![1])).toContain('width: 100vw;');
+    expect(compact(narrowSheets[0]![1])).toContain('height: 100dvh;');
   });
 
-  it('the proposal context has its OWN grid track (never stacked on the meta label) and the pointer control is themed', async () => {
+  it('the owner context has its OWN grid track, the proposal card never lands in the row cells, and the pointer control is themed', async () => {
     const { existsSync, readFileSync } = await import('node:fs');
     const { join } = await import('node:path');
     const file = [join(process.cwd(), 'src/styles/components.css'), join(process.cwd(), 'web/src/styles/components.css')].find((path) =>
@@ -4400,18 +4492,23 @@ describe('FOR YOU owner band (permanent, top of board)', () => {
     const css = readFileSync(file, 'utf8');
     const contextRule = /\.board-owner__context,\s*\.board-owner__pointer-text\s*\{([^}]*)\}/u.exec(css)?.[1] ?? '';
     expect(contextRule.replace(/\s+/gu, ' ')).toContain('grid-area: context;');
-    // EACH desktop template carries the track by name, so the prose can
-    // never share the label's cell (the R1 overlap). A global toContain
-    // would pass while one of the two templates regressed.
+    // The base template carries the track by name, so the prose can never
+    // share the label's cell (the R1 overlap).
     const compact = (block: string | undefined): string => (block ?? '').replace(/\s+/gu, ' ');
     const desktopBase = /\.board-owner__row\s*\{([^}]*)\}/u.exec(css)?.[1];
-    const desktopProposal = /\.board-owner__row--proposal\s*\{([^}]*)\}/u.exec(css)?.[1];
     expect(compact(desktopBase)).toContain("'context action'");
-    expect(compact(desktopProposal)).toContain("'context action'");
+    // The proposal card is its own grid: none of the row's named cells, so
+    // its title, meta and context (which keep their shared classes) can
+    // never be placed into them and overlap.
+    expect(compact(/\.board-lessons\s*\{([^}]*)\}/u.exec(css)?.[1])).toContain('grid-template-areas: none;');
+    expect(compact(/\.board-lessons > \*\s*\{([^}]*)\}/u.exec(css)?.[1])).toContain('grid-area: auto;');
+    for (const selector of ['.board-lessons__strip .board-lessons__headline', '.board-lessons__strip .board-lessons__when', '.board-lessons__story .board-lessons__context']) {
+      const escaped = selector.replace(/[.*+?^${}()|[\]\\]/gu, '\\$&');
+      expect(compact(new RegExp(`${escaped}\\s*\\{([^}]*)\\}`, 'u').exec(css)?.[1]), selector).toContain('grid-area: auto;');
+    }
     const narrowStart = css.indexOf('@media (max-width: 560px) {');
     const narrow = css.slice(narrowStart, css.indexOf('\n}\n', narrowStart));
     expect(compact(/\.board-owner__row\s*\{([^}]*)\}/u.exec(narrow)?.[1])).toContain("'context'");
-    expect(compact(/\.board-owner__row--proposal\s*\{([^}]*)\}/u.exec(narrow)?.[1])).toContain("'context'");
     // The themed Go-to control follows the narrow alignment group too:
     // resolve the RULE BODY (not a substring), so the pin fails if the
     // declaration or the membership goes away (and never on comma order).

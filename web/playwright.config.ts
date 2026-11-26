@@ -125,7 +125,7 @@ export default defineConfig({
     },
     {
       // Book of Lessons proposal on a phone (owner decision 2026-10-07):
-      // the open review's real layout at 360/375/390 px. Synthetic
+      // the card and its review sheet's real layout at 360/375/390 px. Synthetic
       // WebSocket-seeded snapshot + review fetch; no decision is clicked.
       name: 'lesson-proposal',
       testMatch: 'lesson-proposal.spec.ts',

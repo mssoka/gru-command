@@ -575,6 +575,10 @@ export const LESSONS_PROPOSAL_KIND = 'lessons.proposal';
  * the cap dropped (mirrors ARCHIVED_LESSON_SLUG in src/lessons/types.ts). */
 export const ARCHIVED_LESSON_SLUG = 'archived-provenance';
 
+/** The marker the chapter cap appends to a lesson body it shortened
+ * (mirrors TRIM_MARKER in src/lessons/bible.ts). */
+export const LESSON_TRIM_MARKER = ' … [trimmed to fit the chapter cap]';
+
 /** One lesson as the owner reviews it (previous* null = new lesson). */
 export interface LessonChangeView {
   readonly slug: string;
