@@ -147,6 +147,8 @@ export function isCutOnly(lesson: LessonChangeView): boolean {
   if (lesson.previousBody === null) return false;
   const { text, cut } = splitCut(lesson.body);
   if (!cut) return false;
+  // The server knows exactly who changed it; the text test is the fallback.
+  if (lesson.byWriter !== undefined) return !lesson.byWriter;
   if (lesson.previousRecurred !== lesson.recurred) return false;
   return splitCut(lesson.previousBody).text.trimEnd().startsWith(text.trimEnd());
 }
@@ -318,3 +320,26 @@ export function labelChanges(before: readonly string[], after: readonly string[]
 }
 
 
+
+/** The key "Save my choices" sends to drop a lesson change
+ * (`<chapter>/<lesson>`) or a chapter's retirement (`<chapter>`). */
+export function changeKey(chapterSlug: string, lessonSlug?: string): string {
+  return lessonSlug === undefined ? chapterSlug : `${chapterSlug}/${lessonSlug}`;
+}
+
+/** A change the owner may keep or drop: one the lesson writer made. Cuts,
+ * cap removals and the cap's archive record are side effects. */
+export function isDroppable(lesson: LessonChangeView): boolean {
+  if (lesson.byWriter !== undefined) return lesson.byWriter;
+  return lesson.slug !== ARCHIVED_LESSON_SLUG && !isCutOnly(lesson);
+}
+
+/** Every change of a proposal the owner may drop, by key. */
+export function droppableKeys(review: LessonProposalView): string[] {
+  const keys: string[] = [];
+  for (const chapter of review.chapters) {
+    if (chapter.retired) keys.push(changeKey(chapter.slug));
+    for (const lesson of [...chapter.added, ...chapter.changed]) if (isDroppable(lesson)) keys.push(changeKey(chapter.slug, lesson.slug));
+  }
+  return keys;
+}

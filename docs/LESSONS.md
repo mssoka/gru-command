@@ -72,7 +72,15 @@ what changes** opens the full review: every chapter and lesson the Accept
 would write, each reworded lesson with its changes marked word by word
 (in place for an edit, before and after side by side for a rewrite).
 **Accept all** writes the update; **Reject all** keeps the book as it is
-and consumes the batch. Bob also writes a one-sentence `overview` for the
+and consumes the batch. Every change the lesson writer made — a new
+lesson, an updated one, a retired chapter — also has **Keep / Drop**;
+**Save my choices** writes everything except what was dropped (a dropped
+update keeps the old lesson, a dropped new lesson is left out, a chapter
+whose every change is dropped stays as it is). Cuts and removals the
+chapter cap forces are side effects, not choices. The server re-plans the
+kept changes on the same book, and if they would cut or remove anything
+the review did not show, nothing is recorded or written and the owner is
+told what (HTTP 409 `proposal_overflow`). Bob also writes a one-sentence `overview` for the
 owner in the same pass (no extra model call); the card and the review
 show it as Gru speaking.
 

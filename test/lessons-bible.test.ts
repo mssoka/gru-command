@@ -1016,6 +1016,7 @@ describe('plan, then apply only onto the planned book (owner decision 2026-10-07
             previousBody: null,
             previousRecurred: null,
             previousTags: null,
+            byWriter: true,
           },
         ],
         changed: [

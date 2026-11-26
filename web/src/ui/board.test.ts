@@ -3682,6 +3682,133 @@ describe('FOR YOU owner band (permanent, top of board)', () => {
     }
   });
 
+  /** A review with every kind of card: writer changes (choices) and cap side effects (none). */
+  function choicesReview(overrides: Record<string, unknown> = {}) {
+    const cut = ' … [trimmed to fit the chapter cap]';
+    return proposalReview({
+      chapters: [
+        {
+          slug: 'ops',
+          title: { before: 'Ops', after: 'Ops' },
+          retired: false,
+          summary: { before: 'Restart discipline.', after: 'Restart discipline.' },
+          tags: { before: ['ops'], after: ['ops'] },
+          added: [lessonChange('close-shell', 'Close the shell first.', { byWriter: true })],
+          changed: [
+            lessonChange('drain', 'Drain the queue before a roll.', { recurred: 3, previousBody: 'Drain.', previousRecurred: 2, previousTags: [], byWriter: true }),
+            lessonChange('gate-greps', `Check each gate against the page${cut}`, { previousBody: 'Check each gate against the page, not the source.', previousRecurred: 1, previousTags: [], byWriter: false }),
+          ],
+          removed: [{ slug: 'old-note', body: 'An old note the cap drops.', recurred: 1, tags: [], reason: 'cap' }],
+          provenanceTrimmed: 0,
+          bodiesTrimmed: 1,
+        },
+        {
+          slug: 'model-policy',
+          title: { before: 'Model policy', after: 'Model policy' },
+          retired: true,
+          summary: { before: 'Which model does what.', after: '' },
+          tags: { before: [], after: [] },
+          added: [],
+          changed: [],
+          removed: [{ slug: 'sol-for-silas', body: 'Silas runs on Sol.', recurred: 1, tags: [], reason: 'retired' }],
+          provenanceTrimmed: 0,
+          bodiesTrimmed: 0,
+        },
+      ],
+      ...overrides,
+    });
+  }
+  const keepDropOf = (key: string, side: 'keep' | 'drop'): HTMLButtonElement =>
+    reviewSheet()!.querySelector<HTMLButtonElement>(`.board-lessons__keep-drop-${side}[data-change-key="${key}"]`)!;
+
+  it('Keep / Drop: the writer’s changes are choices, side effects of the size limit say why not; Save my choices sends exactly the drops', async () => {
+    const client = proposalClient(decided, choicesReview());
+    const view = new BoardView(() => {}, client);
+    view.render(snapshot({ notifications: [proposalNotice] }));
+    await flush();
+    const sheet = openReview();
+    const choosable = [...sheet.querySelectorAll<HTMLElement>('.board-lessons__keep-drop-keep')].map((button) => button.dataset.changeKey);
+    expect(choosable).toEqual(['ops/close-shell', 'ops/drain', 'model-policy']);
+    expect([...sheet.querySelectorAll('.board-lessons__keep-drop-keep')].every((button) => button.getAttribute('aria-pressed') === 'true')).toBe(true);
+    // The cut and the cap removal explain themselves instead.
+    expect([...sheet.querySelectorAll('.board-lessons__forced')]).toHaveLength(2);
+    // Nothing dropped: no Save my choices anywhere.
+    expect(document.querySelector('.board-lessons__keep')).toBeNull();
+    keepDropOf('ops/close-shell', 'drop').click();
+    keepDropOf('model-policy', 'drop').click();
+    const card = document.getElementById('board-owner')!.querySelector<HTMLElement>('[data-proposal-id="lp-1"]')!;
+    expect(card.querySelector('.board-lessons__choice--keep')?.textContent).toBe('✓ Save my choicesWrites everything except the 2 changes you dropped, which stay as they are.');
+    expect(sheet.querySelector('.board-lessons-sheet__hint')?.textContent).toBe('Dropping 2 changes. Save my choices writes everything else. Keep all again');
+    expect(sheet.querySelector('[data-lesson-kind="new"]')?.textContent).toContain('Dropped: this lesson will not be added.');
+    expect(sheet.querySelector('[data-chapter="model-policy"]')?.textContent).toContain('Dropped: the chapter stays in the book, with all its lessons.');
+    // Keep all again, then drop one, then save.
+    sheet.querySelector<HTMLButtonElement>('.board-lessons-sheet__reset')!.click();
+    expect(document.querySelector('.board-lessons__keep')).toBeNull();
+    keepDropOf('ops/drain', 'drop').click();
+    sheet.querySelector<HTMLButtonElement>('.board-lessons-sheet__actions .board-lessons__keep')!.click();
+    await flush();
+    expect(client.decideLessonProposal).toHaveBeenCalledTimes(1);
+    expect(client.decideLessonProposal).toHaveBeenCalledWith('prop-1', 'accept', ['ops/drain']);
+    expect(document.getElementById('board-owner')!.querySelector('[role="alert"]')?.textContent).toBe('Your choices are recorded; the board is refreshing.');
+    // Recorded: Accept all and Reject all are locked, and the choices can no longer change.
+    expect([...document.getElementById('board-owner')!.querySelectorAll<HTMLButtonElement>('.board-owner__accept, .board-owner__reject')].every((button) => button.disabled)).toBe(true);
+  });
+
+  it('an unconfirmed Save my choices locks the choices and retries exactly the same drops; an overflow refusal frees them with the server’s words', async () => {
+    const { BoardApiError } = await import('../lib/board-client.js');
+    const calls: unknown[][] = [];
+    const outcomes: Array<() => Promise<unknown>> = [
+      () => Promise.reject(new TypeError('fetch failed')),
+      () => Promise.reject(new BoardApiError('/api/lessons/proposal/prop-1/accept', 409, 'proposal_overflow',
+        'nothing was written — with your choices “Drain” in “Ops” would be cut short, which the review did not show. Drop another change in that chapter, or accept all')),
+    ];
+    const client = proposalClient((...args: unknown[]) => {
+      calls.push(args);
+      return outcomes.shift()!();
+    }, choicesReview());
+    const view = new BoardView(() => {}, client);
+    view.render(snapshot({ notifications: [proposalNotice] }));
+    await flush();
+    const sheet = openReview();
+    keepDropOf('ops/close-shell', 'drop').click();
+    sheet.querySelector<HTMLButtonElement>('.board-lessons-sheet__actions .board-lessons__keep')!.click();
+    await flush();
+    expect(calls).toEqual([['prop-1', 'accept', ['ops/close-shell']]]);
+    // The reload found nothing recorded: the choices are free again (#277),
+    // and the owner's current Keep / Drop is what a new save sends.
+    expect(keepDropOf('ops/drain', 'drop').disabled).toBe(false);
+    keepDropOf('ops/drain', 'drop').click();
+    sheet.querySelector<HTMLButtonElement>('.board-lessons-sheet__actions .board-lessons__keep')!.click();
+    await flush();
+    expect(calls[1]).toEqual(['prop-1', 'accept', ['ops/close-shell', 'ops/drain']]);
+    const alert = document.getElementById('board-owner')!.querySelector('[role="alert"]')?.textContent;
+    expect(alert).toBe('Nothing was written — with your choices “Drain” in “Ops” would be cut short, which the review did not show. Drop another change in that chapter, or accept all.');
+    // Refused before anything was recorded: the review stays, every choice is open.
+    expect(sheet.textContent).toContain('Close the shell first.');
+    expect(keepDropOf('ops/drain', 'keep').disabled).toBe(false);
+    expect(sheet.querySelector<HTMLButtonElement>('.board-lessons-sheet__actions .board-owner__accept')!.disabled).toBe(false);
+  });
+
+  it('a "Save my choices" recorded elsewhere shows those choices, and only Save my choices can finish it', async () => {
+    const recorded = choicesReview({ decision: { kind: 'accepted', at: '2026-01-01T00:05:00.000Z', dropped: ['ops/drain'] } });
+    const client = proposalClient(decided, recorded);
+    const view = new BoardView(() => {}, client);
+    view.render(snapshot({ notifications: [proposalNotice] }));
+    await flush();
+    const band = document.getElementById('board-owner')!;
+    expect(band.querySelector('[role="alert"]')?.textContent).toBe('Your choices are recorded but not finished — press Save my choices to finish it.');
+    const keep = band.querySelector<HTMLButtonElement>('.board-lessons__keep')!;
+    expect([keep.disabled, band.querySelector<HTMLButtonElement>('.board-owner__accept')!.disabled, band.querySelector<HTMLButtonElement>('.board-owner__reject')!.disabled])
+      .toEqual([false, true, true]);
+    const sheet = openReview();
+    expect(keepDropOf('ops/drain', 'drop').getAttribute('aria-pressed')).toBe('true');
+    expect(keepDropOf('ops/drain', 'keep').disabled).toBe(true);
+    keep.click();
+    await flush();
+    expect(client.decideLessonProposal).toHaveBeenCalledWith('prop-1', 'accept', ['ops/drain']);
+    expect(sheet.open).toBe(true);
+  });
+
   it('a snapshot push keeps the review open, its text loaded, and an in-flight decision locked on the card and in the sheet', async () => {
     let finish: () => void = () => {};
     const client = proposalClient(

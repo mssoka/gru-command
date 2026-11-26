@@ -7,7 +7,7 @@ import { LedgerDb } from '../src/ledger/db.js';
 import { NotificationCenter } from '../src/notifications/center.js';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { BibleStore } from '../src/lessons/bible.js';
+import { BibleStore, serializeChapter } from '../src/lessons/bible.js';
 import {
   dreamFailureIncidents,
   DREAM_FAILED_KIND,
@@ -890,6 +890,7 @@ describe('owner-approved lesson proposals (owner decision 2026-10-07)', () => {
             previousBody: null,
             previousRecurred: null,
             previousTags: null,
+            byWriter: true,
           },
         ],
         changed: [],
@@ -1401,6 +1402,120 @@ describe('owner-approved lesson proposals (owner decision 2026-10-07)', () => {
     await plain.engine.run();
     expect(plain.stored()['overview']).toBeNull();
     expect(plain.proposals.review()!.overview).toBeNull();
+  });
+
+  /** A book with one accepted chapter, then a second pass the owner reviews:
+   * it rewords `shell-hang`, adds `drain-first` and a new chapter. */
+  async function twoPassHarness(opts: { readonly chapterCapBytes?: number; readonly first?: string; readonly reword?: string; readonly added?: string } = {}) {
+    const root = tmpDir('gru-command-choices-');
+    const journal = new JournalStore(join(root, 'journal'));
+    const bible = new BibleStore(join(root, 'bible'), opts.chapterCapBytes === undefined ? {} : { chapterCapBytes: opts.chapterCapBytes });
+    let pass = 0;
+    const distiller = new FakeDistiller((input) => {
+      pass += 1;
+      const ids = input.entries.map((entry) => entry.id);
+      if (pass === 1) return { chapters: [updateFrom(input.entries, opts.first ?? 'Close the shell first.')] };
+      return {
+        chapters: [
+          {
+            slug: 'ops-restarts',
+            title: 'Ops restarts',
+            summary: 'Restart discipline.',
+            tags: ['ops'],
+            lessons: [
+              { slug: 'shell-hang', body: opts.reword ?? 'Close the shell first, then confirm it exited.', journalIds: ids, mergeInto: 'shell-hang' },
+              { slug: 'drain-first', body: opts.added ?? 'Drain the queue before a roll.', journalIds: ids },
+            ],
+          },
+          { slug: 'review-rounds', title: 'Review rounds', summary: 'One head per round.', tags: ['review'], lessons: [{ slug: 'one-head', body: 'A round binds one head.', journalIds: ids }] },
+        ],
+      };
+    });
+    const notifier = new FakeNotifier();
+    const proposals = new LessonProposals({ bible, notifier });
+    const engine = new DreamEngine({ journal, bible, distiller, proposals });
+    journal.append({ kind: 'finding', source: 'gru', body: 'shell hang finding' });
+    await engine.run();
+    proposals.accept(proposals.review()!.id);
+    journal.append({ kind: 'finding', source: 'gru', body: 'drain finding' });
+    await engine.run();
+    return { bible, proposals, notifier, file: join(bible.dir, PROPOSAL_FILE) };
+  }
+
+  it('Save my choices writes only the kept changes: a dropped new lesson is left out, a dropped rewording keeps the old lesson, a chapter with every change dropped is not created', async () => {
+    const h = await twoPassHarness();
+    const review = h.proposals.review()!;
+    const ops = review.chapters.find((chapter) => chapter.slug === 'ops-restarts')!;
+    // Every lesson the writer touched is a choice; the server says so.
+    expect(ops.changed.map((lesson) => [lesson.slug, lesson.byWriter])).toEqual([['shell-hang', true]]);
+    expect(ops.added.map((lesson) => [lesson.slug, lesson.byWriter])).toEqual([['drain-first', true]]);
+    const before = h.bible.readChapter('ops-restarts')!;
+    const decision = h.proposals.accept(review.id, ['ops-restarts/shell-hang', 'review-rounds/one-head']);
+    expect(decision).toMatchObject({ id: review.id, decision: 'accepted', coveredThroughSeq: 2 });
+    const after = h.bible.readChapter('ops-restarts')!;
+    // The dropped rewording: the lesson exactly as it was (text, count, sources).
+    expect(after.lessons.find((lesson) => lesson.slug === 'shell-hang')).toEqual(before.lessons.find((lesson) => lesson.slug === 'shell-hang'));
+    // The kept new lesson is written.
+    expect(after.lessons.map((lesson) => lesson.slug)).toEqual(['shell-hang', 'drain-first']);
+    // Every change of the new chapter dropped: it is not created.
+    expect(h.bible.readChapter('review-rounds')).toBeNull();
+    expect(h.bible.readIndexText()).not.toContain('review-rounds');
+    expect(h.notifier.resolved).toContainEqual({ id: review.notificationId, by: 'owner:accepted' });
+    expect(h.proposals.review()).toBeNull();
+  });
+
+  it('kept choices are exact: a retry must repeat them, Accept all or other drops are refused once recorded, a Reject takes none, and an unknown change is refused before anything is recorded', async () => {
+    const h = await twoPassHarness();
+    const review = h.proposals.review()!;
+    const untouched = readFileSync(h.file, 'utf-8');
+    expect(() => h.proposals.accept(review.id, ['ops-restarts/not-a-lesson'])).toThrowError(
+      expect.objectContaining({ code: 'choices', message: expect.stringContaining('"ops-restarts/not-a-lesson" is not a change in this update that can be dropped') }),
+    );
+    expect(() => h.proposals.reject(review.id, ['ops-restarts/drain-first'])).toThrowError(expect.objectContaining({ code: 'choices' }));
+    expect(readFileSync(h.file, 'utf-8')).toBe(untouched); // nothing recorded
+    // Record the choices but fail the finish (the notice store is down): the record holds them.
+    h.notifier.failResolve = 1;
+    expect(() => h.proposals.accept(review.id, ['review-rounds/one-head'])).toThrowError(expect.objectContaining({ code: 'incomplete' }));
+    const stored = JSON.parse(readFileSync(h.file, 'utf-8')) as { decision: { dropped: string[] } };
+    expect(stored.decision.dropped).toEqual(['review-rounds/one-head']);
+    expect(h.proposals.review()!.decision).toMatchObject({ kind: 'accepted', dropped: ['review-rounds/one-head'] });
+    expect(() => h.proposals.accept(review.id)).toThrowError(expect.objectContaining({ code: 'decided', message: 'this lesson proposal was already accepted with 1 change(s) dropped' }));
+    expect(() => h.proposals.accept(review.id, ['ops-restarts/drain-first'])).toThrowError(expect.objectContaining({ code: 'decided' }));
+    // The same choices finish it, exactly once.
+    expect(h.proposals.accept(review.id, ['review-rounds/one-head'])).toMatchObject({ decision: 'accepted' });
+    expect(h.bible.readChapter('review-rounds')).toBeNull();
+    expect(h.bible.readChapter('ops-restarts')!.lessons.map((lesson) => lesson.slug)).toEqual(['shell-hang', 'drain-first']);
+  });
+
+  it('kept choices that would cut a lesson the owner never saw cut write nothing and say what they would cut', async () => {
+    // The rewording shortens a long lesson to make room for a new one; keeping
+    // the long old text instead overflows the chapter.
+    const long = `Close the shell first. ${'Then wait for the process to exit and check its status. '.repeat(30)}`.trim();
+    const reword = 'Close the shell, then confirm the exit.';
+    const added = `Drain first. ${'Wait for every in-flight job to settle before the roll. '.repeat(30)}`.trim();
+    const probe = await twoPassHarness({ first: long, reword, added });
+    const fits = probe.bible.readChapter('ops-restarts')!;
+    // A cap that holds the long lesson alone and the reworded pair, never both long ones.
+    const cap = Buffer.byteLength(serializeChapter({ ...fits, lessons: [...fits.lessons, { slug: 'drain-first', body: added, recurred: 1, provenance: fits.lessons[0]!.provenance, tags: [] }] }), 'utf8') - 400;
+    const h = await twoPassHarness({ chapterCapBytes: cap, first: long, reword, added });
+    const review = h.proposals.review()!;
+    const ops = review.chapters.find((chapter) => chapter.slug === 'ops-restarts')!;
+    expect([...ops.added, ...ops.changed].some((lesson) => lesson.body.includes('[trimmed to fit the chapter cap]'))).toBe(false);
+    const untouched = readFileSync(h.file, 'utf-8');
+    const bookBefore = JSON.stringify(h.bible.readChapters());
+    let refusal: unknown;
+    try {
+      h.proposals.accept(review.id, ['ops-restarts/shell-hang']);
+    } catch (error) {
+      refusal = error;
+    }
+    expect(refusal).toMatchObject({ code: 'overflow' });
+    expect((refusal as Error).message).toMatch(/^nothing was written — with your choices “.+” in “Ops restarts” would be cut short, which the review did not show\. Drop another change in that chapter, or accept all$/u);
+    expect(readFileSync(h.file, 'utf-8')).toBe(untouched);
+    expect(JSON.stringify(h.bible.readChapters())).toBe(bookBefore);
+    // Dropping the long new lesson too makes room: that is written.
+    expect(h.proposals.accept(review.id, ['ops-restarts/drain-first', 'ops-restarts/shell-hang'])).toMatchObject({ decision: 'accepted' });
+    expect(h.bible.readChapter('ops-restarts')!.lessons.map((lesson) => lesson.body)).toEqual([long]);
   });
 
   it('a bounded replay keeps its tail: two replayed entries, one per pass, Accept then Reject, cursor never rewinds', async () => {

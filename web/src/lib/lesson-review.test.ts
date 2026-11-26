@@ -3,6 +3,8 @@ import { LESSON_TRIM_MARKER, type LessonChangeView, type LessonProposalView } fr
 import {
   REWRITE_RATIO,
   analyseProposal,
+  droppableKeys,
+  isDroppable,
   changeSize,
   isCutOnly,
   lessonDiff,
@@ -183,5 +185,27 @@ describe('lessonName', () => {
   it('turns a slug into a sentence and says what the archive record is', () => {
     expect(lessonName('wall-means-wait-not-restart')).toBe('Wall means wait not restart');
     expect(lessonName('archived-provenance')).toBe('Archive record (where dropped lessons came from)');
+  });
+});
+
+describe('which changes the owner may drop', () => {
+  it('follows the server: the writer’s additions and updates and a retired chapter — never a cut or the cap’s archive record', () => {
+    const base = review();
+    const withFlags = review({
+      chapters: [
+        {
+          ...base.chapters[0]!,
+          added: [{ ...base.chapters[0]!.added[0]!, byWriter: true }, { slug: 'archived-provenance', body: 'Archive.', recurred: 1, tags: [], previousBody: null, previousRecurred: null, previousTags: null, byWriter: false }],
+          changed: [{ ...base.chapters[0]!.changed[0]!, byWriter: true }, { ...base.chapters[0]!.changed[1]!, byWriter: false }],
+        },
+        { ...base.chapters[1]!, slug: 'gone', retired: true, added: [], removed: [{ slug: 'x', body: 'X.', recurred: 1, tags: [], reason: 'retired' }] },
+      ],
+    });
+    expect(droppableKeys(withFlags)).toEqual(['gates/new-one', 'gates/reworded', 'gone']);
+    // Without the server's flag (an older server) the text test stands in.
+    expect(droppableKeys(review())).toEqual(['gates/new-one', 'gates/reworded', 'fresh/first']);
+    expect(isDroppable({ slug: 'archived-provenance', body: 'A.', recurred: 1, tags: [], previousBody: null, previousRecurred: null, previousTags: null })).toBe(false);
+    // The flag wins over the text test: a tags-only update that is also cut is still a choice.
+    expect(isCutOnly({ ...changed('t', 'Long text here.', `Long text${LESSON_TRIM_MARKER}`, { recurred: 1, previousRecurred: 1 }), byWriter: true })).toBe(false);
   });
 });

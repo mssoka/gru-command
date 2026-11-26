@@ -2954,6 +2954,109 @@ body {
   color: var(--on-state);
 }
 
+/* "Save my choices" (owner request 2026-11-26): the owner's own mix of
+   kept changes — yellow, the colour of the owner's hand on the board. */
+.board-lessons__keep {
+  justify-self: start;
+  padding: 8px 14px;
+  border: var(--outline);
+  border-radius: var(--radius-sm);
+  background: var(--work);
+  color: var(--on-state);
+  box-shadow: var(--shadow-btn);
+  font-size: 14px;
+  font-weight: 800;
+  white-space: nowrap;
+  cursor: pointer;
+}
+
+.board-lessons__keep:disabled {
+  opacity: 0.6;
+  cursor: default;
+  box-shadow: none;
+}
+
+.board-lessons__choice--keep {
+  box-shadow: 0 0 0 3px var(--work);
+}
+
+.board-lessons__keep-drop {
+  display: inline-flex;
+  flex: none;
+  margin-left: auto;
+  overflow: hidden;
+  border: 2px solid var(--line);
+  border-radius: 999px;
+}
+
+.board-lessons__keep-drop button {
+  padding: 4px 12px;
+  border: 0;
+  background: var(--soft);
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 800;
+  cursor: pointer;
+}
+
+.board-lessons__keep-drop button + button {
+  border-left: 2px solid var(--line);
+}
+
+.board-lessons__keep-drop .board-lessons__keep-drop-keep[aria-pressed='true'] {
+  background: var(--done);
+  color: var(--on-state);
+}
+
+.board-lessons__keep-drop .board-lessons__keep-drop-drop[aria-pressed='true'] {
+  background: var(--alert);
+  color: var(--on-state);
+}
+
+.board-lessons__keep-drop button:disabled {
+  cursor: default;
+  opacity: 0.7;
+}
+
+.board-lessons__lesson--dropped {
+  border-style: dashed;
+}
+
+.board-lessons__lesson--dropped > :not(.board-lessons__lesson-head):not(.board-lessons__dropped-note) {
+  opacity: 0.55;
+}
+
+.board-lessons__dropped-note {
+  color: var(--diff-del-ink);
+  font-size: 13px;
+  font-weight: 800;
+}
+
+.board-lessons__forced {
+  padding: 8px 10px;
+  border-radius: var(--radius-sm);
+  background: var(--soft);
+  color: var(--muted);
+  font-size: 13px;
+  line-height: 1.45;
+}
+
+.board-lessons-sheet__reset {
+  padding: 0;
+  border: 0;
+  background: none;
+  color: var(--ink);
+  font-size: 13px;
+  font-weight: 800;
+  text-decoration: underline;
+  cursor: pointer;
+}
+
+.board-lessons-sheet__reset:disabled {
+  opacity: 0.6;
+  cursor: default;
+}
+
 .board-lessons__accept:disabled,
 .board-lessons__reject:disabled {
   opacity: 0.6;

@@ -371,6 +371,25 @@ describe('lesson proposal roundtrip through the real client, servers, ledger and
     expect(id).not.toBe('');
   });
 
+  it('Save my choices in the sheet sends the dropped change through the real client and server: only what was kept is written', async () => {
+    const h = (harness = await boot());
+    await connect(h);
+    const { notificationId } = await h.propose();
+    await shownRow(notificationId);
+    openReview(notificationId);
+    await waitFor(() => {
+      if (sheetLesson() === null) throw new Error('review not loaded yet');
+    });
+    document.querySelector<HTMLButtonElement>('dialog.board-lessons-sheet .board-lessons__keep-drop-drop[data-change-key="ops-restarts/shell-hang"]')!.click();
+    document.querySelector<HTMLButtonElement>('dialog.board-lessons-sheet .board-lessons-sheet__actions .board-lessons__keep')!.click();
+    await waitFor(() => expect(row(notificationId)).toBeNull());
+    // The only change was dropped: accepted, the batch consumed, nothing written.
+    expect(h.bible.readChapter('ops-restarts')).toBeNull();
+    expect(h.cursor()).toBe(1);
+    expect(h.notification(notificationId)?.resolvedBy).toBe('owner:accepted');
+    expect(h.proposals.review()).toBeNull();
+  });
+
   it('a network failure is unconfirmed, a real 409 is translated, and Reject finishes with the book byte-identical', async () => {
     const h = (harness = await boot());
     const wire = await connect(h);

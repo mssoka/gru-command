@@ -149,7 +149,7 @@ import { BoardApiError, type BoardClient, type BoardConnectionState, type BoardS
 import type { StorageLike } from '../theme.js';
 import { DECISION_LABELS, decisionChipTone } from './decisions-status.js';
 import { el, mustGet } from './dom.js';
-import { analyseProposal, plural, proposalHeadline } from '../lib/lesson-review.js';
+import { analyseProposal, droppableKeys, plural, proposalHeadline } from '../lib/lesson-review.js';
 import {
   LESSON_FILTERS,
   filterCounts,
@@ -489,8 +489,7 @@ export class BoardView {
       // Keep its choice as the only retryable action until the new server
       // confirms what happened; an opposite POST must never race it.
       this.invalidateProposalState(state, true);
-      const label = state.pendingDecision === 'accept' ? 'Accept' : 'Reject';
-      state.message ??= `Your ${label} may have been recorded. The opposite choice is locked until the server confirms the outcome.`;
+      state.message ??= `${CHOICE_WORDS[state.pendingDecision].maybe} may have been recorded. The other choices are locked until the server confirms the outcome.`;
     }
     this.decisionSubmissions.clear();
     this.decisionOverrides.clear();
@@ -558,6 +557,7 @@ export class BoardView {
     state.inFlight = null;
     state.decisionSubmitting = false;
     if (!preservePendingDecision) state.pendingDecision = null;
+    if (!preservePendingDecision && state.recorded !== 'keep') state.submittedDrop = null;
     state.loadFailed = false;
     if (state.recorded === null && !preservePendingDecision) state.message = null;
     // An open review sheet stays open across a connection blip: it shows
@@ -942,6 +942,8 @@ export class BoardView {
         message: null,
         loadFailed: false,
         filter: 'all',
+        dropped: new Set(),
+        submittedDrop: null,
         actions: null,
       };
       this.proposalStates.set(item.id, state);
@@ -988,8 +990,14 @@ export class BoardView {
             // Recorded elsewhere (another device, or before a restart): only
             // the same decision can finish it. This authoritative review also
             // releases any ambiguous local submission lock.
-            const recorded = proposal.decision.kind === 'accepted' ? 'accept' : 'reject';
+            const dropped = proposal.decision.dropped ?? [];
+            const recorded: LessonChoice = proposal.decision.kind === 'rejected' ? 'reject' : dropped.length > 0 ? 'keep' : 'accept';
             current.recorded = recorded;
+            if (recorded === 'keep') {
+              // Only these choices can finish it: show them, send them.
+              current.dropped = new Set(dropped);
+              current.submittedDrop = [...dropped];
+            }
             current.pendingDecision = null;
             current.inFlight = null;
             current.decisionSubmitting = false;
@@ -1033,8 +1041,10 @@ export class BoardView {
           if (!live()) return;
           // The read answered the ambiguity, so the pending-choice fence ends:
           // a recorded decision locks the opposite action itself, and no
-          // recorded decision leaves both choices available (#277).
+          // recorded decision leaves both choices available (#277) — with the
+          // owner's current Keep / Drop, never the drops of the lost attempt.
           current.pendingDecision = null;
+          if (current.recorded !== 'keep') current.submittedDrop = null;
           if (proposal.decision === null || current.recorded === null) {
             this.rerenderOwner();
             return;
@@ -1054,9 +1064,10 @@ export class BoardView {
           this.rerenderOwner();
         });
     };
-    const decide = (decision: 'accept' | 'reject'): void => {
+    const decide = (decision: LessonChoice): void => {
       if (!this.snapshotIsCurrent || current.inFlight !== null ||
         (current.pendingDecision !== null && current.pendingDecision !== decision)) return;
+      if (decision === 'keep' && current.submittedDrop === null && current.dropped.size === 0) return;
       const client = this.boardClient;
       if (client === null) return;
       const freshnessGeneration = this.snapshotFreshnessGeneration;
@@ -1074,13 +1085,22 @@ export class BoardView {
             return null;
           }
           if (current.recorded !== null && current.recorded !== decision) {
-            current.message = `Not applied — this lesson proposal was already ${current.recorded === 'accept' ? 'accepted' : 'rejected'}.`;
+            current.message = `Not applied — this lesson proposal was already ${CHOICE_WORDS[current.recorded].done}.`;
             return null; // never flip a recorded decision
           }
           if (current.pendingDecision !== null && current.pendingDecision !== decision) return null;
+          // The dropped changes travel with the choice; a retry of an
+          // unconfirmed "Save my choices" resends exactly what was sent.
+          const drop = decision === 'keep'
+            ? (current.submittedDrop ?? droppableKeys(proposal).filter((key) => current.dropped.has(key)).sort())
+            : [];
+          if (decision === 'keep' && drop.length === 0) return null; // nothing this review can drop
+          current.submittedDrop = decision === 'keep' ? drop : null;
           current.pendingDecision = decision;
           current.decisionSubmitting = true;
-          return client.decideLessonProposal(proposal.id, decision);
+          return decision === 'keep'
+            ? client.decideLessonProposal(proposal.id, 'accept', drop)
+            : client.decideLessonProposal(proposal.id, decision);
         })
         .then((result) => {
           if (!currentAction()) return;
@@ -1096,8 +1116,8 @@ export class BoardView {
             current.pendingDecision = null;
             current.recorded = decision;
             current.message =
-              `Your ${decision === 'accept' ? 'Accept' : 'Reject'} is recorded, but finishing it hit a problem` +
-              `${result.detail !== undefined ? ` (${result.detail})` : ''}. Press ${decision === 'accept' ? 'Accept' : 'Reject'} again to finish it.`;
+              `${CHOICE_WORDS[decision].yours} recorded, but finishing it hit a problem` +
+              `${result.detail !== undefined ? ` (${result.detail})` : ''}. Press ${CHOICE_WORDS[decision].button} again to finish it.`;
             this.rerenderOwner();
             return;
           }
@@ -1109,7 +1129,7 @@ export class BoardView {
           current.pendingDecision = null;
           current.recorded = decision;
           current.review = null;
-          current.message = `Your ${decision === 'accept' ? 'Accept' : 'Reject'} is recorded; the board is refreshing.`;
+          current.message = `${CHOICE_WORDS[decision].yours} recorded; the board is refreshing.`;
           this.rerenderOwner();
           client.wake();
         })
@@ -1123,11 +1143,26 @@ export class BoardView {
           const provenNotApplied = error instanceof BoardApiError &&
             ['proposal_stale', 'proposal_mismatch'].includes(error.code ?? '');
           const decidedElsewhere = error instanceof BoardApiError && error.code === 'proposal_decided';
+          // Kept choices the server refused before recording anything (a
+          // change it cannot drop, or a cut the owner never saw): nothing was
+          // written, the review stays, and the owner may choose again.
+          const choicesRefused = error instanceof BoardApiError &&
+            ['proposal_overflow', 'proposal_choices'].includes(error.code ?? '');
+          if (choicesRefused) {
+            current.pendingDecision = null;
+            current.submittedDrop = null;
+            current.message = describeDecisionFailure(error, current.recorded);
+            this.rerenderOwner();
+            return;
+          }
           // An unconfirmed outcome is reconciled below: the reload either
           // learns the durable decision or hands back the review the owner
           // was reading, so its text is only kept when a read confirmed it.
           if (provenNotApplied || decidedElsewhere) current.review = null;
-          if (provenNotApplied || decidedElsewhere) current.pendingDecision = null;
+          if (provenNotApplied || decidedElsewhere) {
+            current.pendingDecision = null;
+            current.submittedDrop = null;
+          }
           // A refusal or lost reply needs an authoritative catch-up; the
           // pending-choice fence remains until that read confirms a result.
           client.wake();
@@ -1197,6 +1232,21 @@ export class BoardView {
     see.addEventListener('click', () => this.openLessonSheet(item.id));
     const choices = el('div', 'board-lessons__choices');
     const buttons = this.lessonDecisionButtons(current, row.actionId, `${focusBase}`);
+    if (this.lessonKeepShown(current) && review !== null) {
+      const count = droppedCount(review, current.dropped);
+      const keepTile = el('div', 'board-lessons__choice board-lessons__choice--keep');
+      keepTile.append(
+        buttons.keep,
+        el(
+          'div',
+          'board-lessons__consequence',
+          count === 1
+            ? 'Writes everything except the 1 change you dropped, which stays as it is.'
+            : `Writes everything except the ${count} changes you dropped, which stay as they are.`,
+        ),
+      );
+      choices.append(keepTile);
+    }
     const acceptTile = el('div', 'board-lessons__choice board-lessons__choice--accept');
     acceptTile.append(buttons.accept);
     const rejectTile = el('div', 'board-lessons__choice');
@@ -1227,32 +1277,46 @@ export class BoardView {
     return node;
   }
 
-  /** Accept all / Reject all for one surface (the card or the sheet): the
-   * same locks everywhere — a recorded decision can only be finished,
-   * never flipped, and an in-flight one locks both. */
+  /** Accept all / Reject all / Save my choices for one surface (the card or
+   * the sheet): the same locks everywhere — a recorded decision can only be
+   * finished, never flipped, and an in-flight one locks every choice. */
   private lessonDecisionButtons(
     current: ProposalRowState,
     actionId: string | null,
     focusBase: string,
-  ): { readonly accept: HTMLButtonElement; readonly reject: HTMLButtonElement } {
-    const accept = document.createElement('button');
-    accept.type = 'button';
-    accept.className = 'board-owner__accept board-lessons__accept';
+  ): { readonly accept: HTMLButtonElement; readonly reject: HTMLButtonElement; readonly keep: HTMLButtonElement } {
+    const locked = (choice: LessonChoice): boolean =>
+      !this.snapshotIsCurrent || current.inFlight !== null ||
+      (current.recorded !== null && current.recorded !== choice) ||
+      (current.pendingDecision !== null && current.pendingDecision !== choice);
+    const button = (choice: LessonChoice, className: string, label: string, busy: string): HTMLButtonElement => {
+      const node = document.createElement('button');
+      node.type = 'button';
+      node.className = className;
+      node.dataset.ownerFocusKey = `${focusBase}:${choice}`;
+      node.textContent = current.inFlight === choice ? busy : label;
+      node.disabled = locked(choice);
+      node.addEventListener('click', () => current.actions?.decide(choice));
+      return node;
+    };
+    const accept = button('accept', 'board-owner__accept board-lessons__accept', '✓ Accept all', 'accepting…');
     if (actionId !== null) accept.dataset.actionId = actionId;
-    accept.dataset.ownerFocusKey = `${focusBase}:accept`;
-    const reject = document.createElement('button');
-    reject.type = 'button';
-    reject.className = 'board-owner__reject board-lessons__reject';
-    reject.dataset.ownerFocusKey = `${focusBase}:reject`;
-    accept.textContent = current.inFlight === 'accept' ? 'accepting…' : '✓ Accept all';
-    reject.textContent = current.inFlight === 'reject' ? 'rejecting…' : '✕ Reject all';
-    accept.disabled = !this.snapshotIsCurrent || current.inFlight !== null || current.recorded === 'reject' ||
-      (current.pendingDecision !== null && current.pendingDecision !== 'accept');
-    reject.disabled = !this.snapshotIsCurrent || current.inFlight !== null || current.recorded === 'accept' ||
-      (current.pendingDecision !== null && current.pendingDecision !== 'reject');
-    accept.addEventListener('click', () => current.actions?.decide('accept'));
-    reject.addEventListener('click', () => current.actions?.decide('reject'));
-    return { accept, reject };
+    const reject = button('reject', 'board-owner__reject board-lessons__reject', '✕ Reject all', 'rejecting…');
+    const keep = button('keep', 'board-lessons__keep', '✓ Save my choices', 'saving…');
+    if (current.submittedDrop === null && current.dropped.size === 0) keep.disabled = true;
+    return { accept, reject, keep };
+  }
+
+  /** Whether Keep / Drop may still change: not while a decision is in
+   * flight, pending or recorded, and not on a stale board. */
+  private lessonChoicesLocked(current: ProposalRowState): boolean {
+    return !this.snapshotIsCurrent || current.inFlight !== null || current.pendingDecision !== null || current.recorded !== null;
+  }
+
+  /** "Save my choices" shows once something is dropped — or while one is
+   * pending or recorded, so only it can finish. */
+  private lessonKeepShown(current: ProposalRowState): boolean {
+    return current.dropped.size > 0 || current.pendingDecision === 'keep' || current.recorded === 'keep';
   }
 
   /** Open the review sheet over the board (a modal dialog: the review needs
@@ -1331,6 +1395,8 @@ export class BoardView {
       current.loadGeneration,
       current.review === null ? (current.loading !== null ? 'loading' : current.loadFailed ? 'failed' : 'none') : current.review.id,
       current.filter,
+      [...current.dropped].sort(),
+      current.submittedDrop,
       current.inFlight,
       current.recorded,
       current.pendingDecision,
@@ -1405,16 +1471,41 @@ export class BoardView {
         filters.append(chip);
       }
       top.append(filters);
-      body.append(lessonChanges(review, current.filter));
+      body.append(lessonChanges(review, current.filter, {
+        dropped: current.dropped,
+        locked: this.lessonChoicesLocked(current),
+        onChange: (key, drop) => {
+          if (this.lessonChoicesLocked(current)) return;
+          if (drop) current.dropped.add(key);
+          else current.dropped.delete(key);
+          this.rerenderOwner();
+          // A stale board has no snapshot to re-render from; the sheet still redraws.
+          this.renderLessonSheet(id, current);
+        },
+      }));
     }
     const foot = el('div', 'board-lessons-sheet__foot');
-    const hint = el(
-      'div',
-      'board-lessons-sheet__hint',
-      review === null
-        ? 'Accept all writes every change; Reject all keeps the book as it is.'
-        : `From ${plural(review.entries, 'journal note')}. Accept all writes every change above; Reject all keeps the book as it is.`,
-    );
+    const hint = el('div', 'board-lessons-sheet__hint');
+    if (review !== null && current.dropped.size > 0) {
+      hint.append(`Dropping ${plural(droppedCount(review, current.dropped), 'change')}. Save my choices writes everything else. `);
+      const reset = el('button', 'board-lessons-sheet__reset', 'Keep all again');
+      reset.type = 'button';
+      reset.dataset.sheetFocus = 'reset';
+      reset.disabled = this.lessonChoicesLocked(current);
+      reset.addEventListener('click', () => {
+        if (this.lessonChoicesLocked(current)) return;
+        current.dropped.clear();
+        this.rerenderOwner();
+        this.renderLessonSheet(id, current);
+      });
+      hint.append(reset);
+    } else {
+      hint.append(
+        review === null
+          ? 'Accept all writes every change; Reject all keeps the book as it is.'
+          : `From ${plural(review.entries, 'journal note')}. Keep or drop any change, or decide them all: Accept all writes every change above; Reject all keeps the book as it is.`,
+      );
+    }
     foot.append(hint);
     if (current.message !== null) {
       const message = el('div', 'board-owner__error board-lessons-sheet__message', current.message);
@@ -1425,6 +1516,8 @@ export class BoardView {
     const buttons = this.lessonDecisionButtons(current, null, `sheet:${id}`);
     buttons.accept.dataset.sheetFocus = 'accept';
     buttons.reject.dataset.sheetFocus = 'reject';
+    buttons.keep.dataset.sheetFocus = 'keep';
+    if (this.lessonKeepShown(current)) actions.append(buttons.keep);
     actions.append(buttons.accept, buttons.reject);
     foot.append(actions);
     frame.append(top, body, foot);
@@ -4240,20 +4333,25 @@ interface ProposalRowState {
   loadController: AbortController | null;
   loadGeneration: number;
   actionGeneration: number;
-  inFlight: 'accept' | 'reject' | null;
+  inFlight: LessonChoice | null;
   decisionSubmitting: boolean;
   /** Submitted intent preserved while its outcome is ambiguous. */
-  pendingDecision: 'accept' | 'reject' | null;
+  pendingDecision: LessonChoice | null;
   /** A decision the server recorded but has not finished (202). */
-  recorded: 'accept' | 'reject' | null;
+  recorded: LessonChoice | null;
   message: string | null;
   /** The message is a failed review load (cleared by a successful retry). */
   loadFailed: boolean;
   /** Which lessons the review sheet shows. */
   filter: LessonFilter;
+  /** The changes the owner dropped (Keep / Drop, owner request 2026-11-26). */
+  dropped: Set<string>;
+  /** The drops sent with a "Save my choices" whose outcome is pending or
+   * recorded: a retry resends exactly these. */
+  submittedDrop: readonly string[] | null;
   /** The latest render's decide/load (their closures carry the client
    * generation), so the sheet's buttons act exactly like the card's. */
-  actions: { readonly decide: (decision: 'accept' | 'reject') => void; readonly load: () => void } | null;
+  actions: { readonly decide: (decision: LessonChoice) => void; readonly load: () => void } | null;
 }
 
 /** ONE decision submission, shared by every surface that renders the
@@ -4366,12 +4464,27 @@ function restoreOwnerFocusKey(key: string | null, root: HTMLElement): void {
   }
 }
 
+/** How many of the changes the owner may choose are dropped. */
+function droppedCount(review: LessonProposalView, dropped: ReadonlySet<string>): number {
+  return droppableKeys(review).filter((key) => dropped.has(key)).length;
+}
+
+/** The owner's three choices on a lesson proposal: Accept all, Reject all,
+ * or "Save my choices" — an Accept without the dropped changes. */
+type LessonChoice = 'accept' | 'keep' | 'reject';
+
+const CHOICE_WORDS: Readonly<Record<LessonChoice, { readonly yours: string; readonly maybe: string; readonly button: string; readonly done: string }>> = {
+  accept: { yours: 'Your Accept is', maybe: 'Your Accept', button: 'Accept', done: 'accepted' },
+  keep: { yours: 'Your choices are', maybe: 'Your choices', button: 'Save my choices', done: 'accepted with your choices' },
+  reject: { yours: 'Your Reject is', maybe: 'Your Reject', button: 'Reject', done: 'rejected' },
+};
+
 /** A decision the server holds but has not finished: what to press. */
-function recordedMessage(recorded: 'accept' | 'reject', conflict: string | null): string {
-  const label = recorded === 'accept' ? 'Accept' : 'Reject';
+function recordedMessage(recorded: LessonChoice, conflict: string | null): string {
+  const words = CHOICE_WORDS[recorded];
   return conflict === null
-    ? `Your ${label} is recorded but not finished — press ${label} to finish it.`
-    : `Your ${label} is recorded but blocked — ${conflict}. See the conflict notice, then press ${label} again.`;
+    ? `${words.yours} recorded but not finished — press ${words.button} to finish it.`
+    : `${words.yours} recorded but blocked — ${conflict}. See the conflict notice, then press ${words.button} again.`;
 }
 
 function describeProposalError(error: unknown): string {
@@ -4382,8 +4495,15 @@ function describeProposalError(error: unknown): string {
  * (stale, already decided, mismatched), a proposal that is gone — whose
  * outcome is unknown, not refused — or an ambiguous network failure. A
  * decision that is recorded but blocked arrives as 202 incomplete instead. */
-function describeDecisionFailure(error: unknown, recorded: 'accept' | 'reject' | null): string {
+function describeDecisionFailure(error: unknown, recorded: LessonChoice | null): string {
   if (error instanceof BoardApiError) {
+    // Kept choices refused before anything was recorded (owner request
+    // 2026-11-26): the server says what they would have cut.
+    if (error.code === 'proposal_overflow') {
+      const detail = error.detail ?? 'nothing was written — your choices would cut something the review did not show';
+      return `${detail.charAt(0).toUpperCase()}${detail.slice(1)}.`;
+    }
+    if (error.code === 'proposal_choices') return `Not written — ${error.detail ?? 'the server refused these choices'}.`;
     // "Not applied" only where the server PROVED nothing happened (C8).
     if (error.code === 'proposal_stale') {
       return `Not applied — ${error.detail ?? 'the Book of Lessons changed'}. A fresh proposal will follow.`;
@@ -4399,8 +4519,8 @@ function describeDecisionFailure(error: unknown, recorded: 'accept' | 'reject' |
     ? `the server failed (${error.status}${error.detail !== null ? `: ${error.detail}` : ''})`
     : describeProposalError(error);
   if (recorded !== null) {
-    const label = recorded === 'accept' ? 'Accept' : 'Reject';
-    return `Your ${label} is recorded, but finishing it could not be confirmed (${reason}). The board is refreshing; press ${label} again to finish it.`;
+    const words = CHOICE_WORDS[recorded];
+    return `${words.yours} recorded, but finishing it could not be confirmed (${reason}). The board is refreshing; press ${words.button} again to finish it.`;
   }
   return `Couldn’t confirm the decision (${reason}) — it may or may not have been recorded. The board is refreshing; check the book or retry.`;
 }
