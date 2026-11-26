@@ -1539,8 +1539,11 @@ export class BoardView {
     if (!control.offer || this.boardClient === null) return;
     const button = document.createElement('button');
     button.type = 'button';
-    button.className = 'command-health__update';
-    button.textContent = 'Update';
+    // A pp-btn (filled, shadowed), so it never reads as one of the pills.
+    button.className = 'pp-btn command-health__update';
+    const icon = el('span', 'command-health__update-icon', '↻');
+    icon.setAttribute('aria-hidden', 'true');
+    button.append(icon, document.createTextNode('Update Now'));
     button.title = UPDATE_BUTTON_TITLE;
     button.setAttribute('aria-label', UPDATE_BUTTON_TITLE);
     button.dataset.actionId = 'deploy-update';

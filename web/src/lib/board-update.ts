@@ -153,6 +153,7 @@ export function updateControl(follow: UpdateFollow, build: BuildView | null | un
   }
 }
 
-/** The button's long explanation (title and accessible name). */
+/** The button's long explanation (title and accessible name). It starts
+ * with the visible label, so a voice user saying "Update Now" finds it. */
 export const UPDATE_BUTTON_TITLE =
-  'Update: pull main, rebuild, and restart the service now, as gru update does. Running turns are cut and resume after the restart.';
+  'Update Now: pull main, rebuild, and restart the service at once, as gru update does. Running turns are cut and resume after the restart.';

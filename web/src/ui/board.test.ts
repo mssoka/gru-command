@@ -649,7 +649,13 @@ describe('board — cockpit health pill and KPI cards (cockpit rework)', () => {
       expect(deploy().querySelector('.command-health__update')).toBeNull();
       view.bindClient(client);
       const button = deploy().querySelector<HTMLButtonElement>('.command-health__update')!;
-      expect(button.textContent).toBe('Update');
+      expect(button.textContent).toBe('↻Update Now');
+      // The accessible name starts with the visible label (voice control).
+      expect(button.getAttribute('aria-label')?.startsWith('Update Now:')).toBe(true);
+      // A real button (pp-btn: filled, shadowed), not one of the pills beside it.
+      expect(button.classList.contains('pp-btn')).toBe(true);
+      expect(button.classList.contains('pp-chip')).toBe(false);
+      expect(button.querySelector('.command-health__update-icon')?.getAttribute('aria-hidden')).toBe('true');
       expect(button.getAttribute('aria-label')).toContain('as gru update does');
 
       button.click();

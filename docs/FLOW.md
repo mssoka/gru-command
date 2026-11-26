@@ -1380,7 +1380,7 @@ machine:
   bin) — wait mode follows the roll to verified completion; `--detach`
   follows it through preflight only, for a caller inside the service.
 - `POST /api/roll` (operator-guarded, pairing token). The board's
-  **Update** button posts `{"mode":"update","now":true}`: `now` skips the
+  **Update Now** button posts `{"mode":"update","now":true}`: `now` skips the
   drain (see below), as a terminal `gru update` does, and the page follows
   `GET /api/roll` until the relaunched service marks the record `done`.
 
@@ -1418,7 +1418,7 @@ idempotent phases:
    swap. Deadline reached → the in-flight work is logged, recorded as
    `abandoned` in the roll record, and the swap proceeds; startup recovery
    terminalizes interrupted rounds INCOMPLETE and resumes interrupted
-   turns (#42). A `now` roll (the board's Update button) has a bound of
+   turns (#42). A `now` roll (the board's Update Now button) has a bound of
    zero: one probe records what is in flight as `abandoned`, the swap
    follows at once, and the record carries `now: true`.
 3. **swap** — re-check the target SHA, write `<data_dir>/roll-marker.json`

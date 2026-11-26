@@ -114,7 +114,7 @@ agent-owned shell), where `launchctl unload`/`load` would kill the
 updater before it could reload the unit. Design, phases, drain bounds,
 and rollback safety: [FLOW.md](./FLOW.md#self-roll-the-service-deploys-itself).
 
-The board's **Update** button runs the same update from the browser. It
+The board's **Update Now** button runs the same update from the browser. It
 appears on the deploy reading whenever that reading flags (a newer
 release, or the build is behind main). One press is a self-roll with
 `now: true`: the service pulls and rebuilds while it keeps serving, then
