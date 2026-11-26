@@ -176,14 +176,20 @@ export function parseDreamOutput(raw: string, entries: readonly JournalEntry[]):
   return { chapters, ...(overview !== undefined ? { overview } : {}) };
 }
 
-/** The optional one-sentence overview: absent stays absent; anything but a
- * non-empty string is a malformed output; whitespace runs collapse to one
- * space so the card shows one line. */
+/** The optional one-sentence overview: absent, null or blank means none
+ * (an update with nothing to say must never fail the whole pass); any
+ * other non-string is a malformed output; whitespace runs collapse to one
+ * space so the card shows one line, and a long one is cut at a word —
+ * never inside a surrogate pair. */
 function parseOverview(value: unknown): string | undefined {
-  if (value === undefined) return undefined;
-  const text = requireString(value, 'overview').replace(/\s+/gu, ' ').trim();
+  if (value === undefined || value === null) return undefined;
+  if (typeof value !== 'string') throw new DreamError('dream output overview must be a string');
+  const text = value.replace(/\s+/gu, ' ').trim();
+  if (text === '') return undefined;
   if (text.length <= OVERVIEW_MAX_CHARS) return text;
-  const cut = text.slice(0, OVERVIEW_MAX_CHARS - 1);
+  let cut = text.slice(0, OVERVIEW_MAX_CHARS - 1);
+  const last = cut.charCodeAt(cut.length - 1);
+  if (last >= 0xd800 && last <= 0xdbff) cut = cut.slice(0, -1);
   const space = cut.lastIndexOf(' ');
   return `${(space > OVERVIEW_MAX_CHARS / 2 ? cut.slice(0, space) : cut).trimEnd()}…`;
 }

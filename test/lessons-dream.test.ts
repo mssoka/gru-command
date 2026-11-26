@@ -282,7 +282,7 @@ describe('dream distiller protocol (one Bob pass)', () => {
     ).toThrowError(/kebab-case slug/);
   });
 
-  it('asks for and parses the owner overview: one line, cut with a visible ellipsis when long, absent stays absent, a non-string is malformed', () => {
+  it('asks for and parses the owner overview: one line, cut with a visible ellipsis when long, absent, null or blank is none, a non-string is malformed', () => {
     const entries = [entry('j-1', 'finding')];
     const prompt = renderDreamPrompt({
       entries,
@@ -302,7 +302,13 @@ describe('dream distiller protocol (one Bob pass)', () => {
     const long = parse(`${'word '.repeat(80)}end`).overview!;
     expect(long.length).toBeLessThanOrEqual(OVERVIEW_MAX_CHARS);
     expect(long.endsWith('word…')).toBe(true);
-    for (const bad of [42, '   ', ['a']]) expect(() => parse(bad), JSON.stringify(bad)).toThrowError(/overview must be a non-empty string/);
+    // Nothing to say never fails the whole pass.
+    for (const none of [null, '', '   \n ']) expect(parse(none), JSON.stringify(none)).not.toHaveProperty('overview');
+    for (const bad of [42, ['a'], { text: 'x' }]) expect(() => parse(bad), JSON.stringify(bad)).toThrowError(/dream output overview must be a string/);
+    // A cut never splits an emoji (a surrogate pair) in half.
+    const emoji = parse(`${'x'.repeat(OVERVIEW_MAX_CHARS - 2)}😀 and more words after it`).overview!;
+    expect(emoji.endsWith('\ud83d…')).toBe(false);
+    expect(Buffer.from(emoji, 'utf8').toString('utf8')).toBe(emoji);
   });
 
   it('accepts a retire update without a lessons array', () => {
