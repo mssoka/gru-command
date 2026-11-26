@@ -1,7 +1,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { createHash } from 'node:crypto';
-import { expect, test, type Page, type WebSocketRoute } from '@playwright/test';
+import { expect, test, type Locator, type Page, type WebSocketRoute } from '@playwright/test';
 import {
   isValidSnapshot,
   parseBoardServerFrame,
@@ -464,6 +464,33 @@ async function bodyOverflow(page: Page): Promise<number> {
   return page.evaluate(() => document.documentElement.scrollWidth - document.documentElement.clientWidth);
 }
 
+/** Open the lesson review sheet and prove what the owner needs from it:
+ * readable mixed-case lesson text with real geometry, no sideways scroll,
+ * and Accept all / Reject all on screen and topmost at their centres. */
+async function expectReadableLessonReview(page: Page, label: string): Promise<Locator> {
+  await page.locator('#board-owner [data-proposal-id="proposal-1"] .board-lessons__see').click();
+  const sheet = page.locator('dialog.board-lessons-sheet');
+  await expect(sheet).toBeVisible();
+  const reviewText = sheet.locator('.board-lessons__text').first();
+  await expect(reviewText).toContainText('Close the shell first');
+  expect(await reviewText.evaluate((element) => getComputedStyle(element).textTransform)).toBe('none');
+  const reviewBox = await reviewText.boundingBox();
+  expect(reviewBox?.width ?? 0).toBeGreaterThan(0);
+  expect(reviewBox?.height ?? 0).toBeGreaterThan(0);
+  const body = await overflows(page, 'dialog.board-lessons-sheet .board-lessons-sheet__body');
+  expect(body.scrollWidth, `${label}: review body sideways scroll`).toBeLessThanOrEqual(body.clientWidth + 1);
+  for (const choice of ['.board-owner__accept', '.board-owner__reject']) {
+    const hit = await sheet.locator(`.board-lessons-sheet__actions ${choice}`).evaluate((element) => {
+      const rect = element.getBoundingClientRect();
+      const inViewport = rect.left >= 0 && rect.top >= 0 && rect.right <= window.innerWidth && rect.bottom <= window.innerHeight;
+      const topmost = document.elementFromPoint(rect.left + rect.width / 2, rect.top + rect.height / 2);
+      return { inViewport, topmost: topmost !== null && (topmost === element || element.contains(topmost)) };
+    });
+    expect(hit, `${label}: ${choice} reachable in the review`).toEqual({ inViewport: true, topmost: true });
+  }
+  return sheet;
+}
+
 /** Measured settled contrast of an element's text against its actual
  * painted surface (opaque backgrounds walked up the ancestor chain). */
 async function contrastOf(page: Page, selector: string): Promise<number> {
@@ -868,17 +895,11 @@ test.describe('notification readability — fixed long-content fixtures', () => 
         expect(detailBox?.height ?? 0).toBeGreaterThan(0);
         const cardOverflow = await overflows(page, '#board-owner [data-notification-id="decision-1"]');
         expect(cardOverflow.scrollWidth).toBeLessThanOrEqual(cardOverflow.clientWidth + 1);
-        // The proposal review's lesson text is readable prose under zoom.
-        const proposal = page.locator('#board-owner [data-proposal-id="proposal-1"]');
-        await proposal.locator('.board-owner__review > summary').click();
-        const reviewText = proposal.locator('.board-owner__review-text').first();
-        await expect(reviewText).toContainText('Close the shell first');
-        expect(await reviewText.evaluate((element) => getComputedStyle(element).textTransform)).toBe('none');
-        const reviewBox = await reviewText.boundingBox();
-        expect(reviewBox?.width ?? 0).toBeGreaterThan(0);
-        expect(reviewBox?.height ?? 0).toBeGreaterThan(0);
+        // The proposal card reflows, and the review's lesson text is
+        // readable prose under zoom with both choices still reachable.
         const proposalOverflow = await overflows(page, '#board-owner [data-proposal-id="proposal-1"]');
         expect(proposalOverflow.scrollWidth).toBeLessThanOrEqual(proposalOverflow.clientWidth + 1);
+        await expectReadableLessonReview(page, `${theme} 200% page zoom`);
         await captureViewport(page, `${theme}-page-zoom-200`, `${theme}: 200% page zoom (CSS zoom; text and layout scale), decision + proposal review expanded`);
       } finally {
         await page.close();
@@ -1307,10 +1328,14 @@ test.describe('notification readability — fixed long-content fixtures', () => 
           const row = page.locator('#board-owner [data-proposal-id="proposal-1"]');
           await expect(row).toBeVisible();
           // Prose is mixed-case readable text, never the label treatment.
+          // The card reads its review on its own: the story, the checks
+          // and what each choice does.
           const context = row.locator('.board-owner__context');
-          await expect(context).toContainText('Two lessons changed');
+          await expect(context).toContainText('Gru read 2 journal notes from recent jobs');
           expect(await context.evaluate((element) => getComputedStyle(element).textTransform)).toBe('none');
-          expect(await row.locator('.board-owner__consequence').evaluate((element) => getComputedStyle(element).textTransform)).toBe('none');
+          for (const prose of ['.board-lessons__check', '.board-lessons__consequence']) {
+            expect(await row.locator(prose).first().evaluate((element) => getComputedStyle(element).textTransform), prose).toBe('none');
+          }
           // The prose owns its grid track: its box must NOT intersect the
           // metadata label's box (the stacked-cell overlap is the R1 bug).
           const metaBox = await row.locator('.board-owner__meta').boundingBox();
@@ -1321,20 +1346,18 @@ test.describe('notification readability — fixed long-content fixtures', () => 
           const contextBottom = contextBox!.y + contextBox!.height;
           const overlap = metaBox!.y < contextBottom && contextBox!.y < metaBottom;
           expect(overlap, `${theme} @${width}: proposal context overlaps its label`).toBe(false);
-          // The review loads on open: readable lesson text, nonzero geometry.
-          await row.locator('.board-owner__review > summary').click();
-          const reviewText = row.locator('.board-owner__review-text').first();
-          await expect(reviewText).toContainText('Close the shell first');
-          expect(await reviewText.evaluate((element) => getComputedStyle(element).textTransform)).toBe('none');
-          const reviewBox = await reviewText.boundingBox();
-          expect(reviewBox?.width ?? 0).toBeGreaterThan(0);
-          expect(reviewBox?.height ?? 0).toBeGreaterThan(0);
           // Accept/Reject survive the readability fix.
           await expect(row.locator('.board-owner__accept')).toBeVisible();
           await expect(row.locator('.board-owner__reject')).toBeVisible();
           const rowOverflow = await overflows(page, '#board-owner [data-proposal-id="proposal-1"]');
           expect(rowOverflow.scrollWidth).toBeLessThanOrEqual(rowOverflow.clientWidth + 1);
           expect(await bodyOverflow(page)).toBeLessThanOrEqual(0);
+          // The review opens over the board: readable lesson text, both
+          // choices in reach.
+          const sheet = await expectReadableLessonReview(page, `${theme} @${width}`);
+          await captureViewport(page, `${theme}-proposal-review-width-${width}`, `${theme}: lesson review open at ${width}px`);
+          await sheet.locator('.board-lessons-sheet__close').click();
+          await expect(sheet).toBeHidden();
           // The bell copy is a readable pointer, not a label line.
           await clickBell(page);
           const pointer = page.locator('#notification-list .board-owner__pointer-text');
@@ -1347,7 +1370,7 @@ test.describe('notification readability — fixed long-content fixtures', () => 
           const pointerOverlap =
             pointerMeta!.y < pointerBox!.y + pointerBox!.height && pointerBox!.y < pointerMeta!.y + pointerMeta!.height;
           expect(pointerOverlap, `${theme} @${width}: pointer text overlaps its label`).toBe(false);
-          await captureViewport(page, `${theme}-proposal-width-${width}`, `${theme}: proposal review expanded at ${width}px`);
+          await captureViewport(page, `${theme}-proposal-width-${width}`, `${theme}: proposal card and bell pointer at ${width}px`);
         } finally {
           await page.close();
         }

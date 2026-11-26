@@ -307,11 +307,12 @@ const alertText = (notificationId: string): Promise<string> =>
     if (text === undefined || text === null) throw new Error('no alert yet');
     return text;
   });
+/** "See what changes": the review opens in a sheet over the board. */
 function openReview(notificationId: string): void {
-  const review = row(notificationId)!.querySelector<HTMLDetailsElement>('.board-owner__review')!;
-  review.open = true;
-  review.dispatchEvent(new Event('toggle'));
+  row(notificationId)!.querySelector<HTMLButtonElement>('.board-lessons__see')!.click();
 }
+/** The first lesson card in the open review sheet (null until the review is read). */
+const sheetLesson = (): Element | null => document.querySelector('dialog.board-lessons-sheet[open] .board-lessons__lesson');
 
 describe('lesson proposal roundtrip through the real client, servers, ledger and snapshot', () => {
   let harness: Harness | null = null;
@@ -356,7 +357,7 @@ describe('lesson proposal roundtrip through the real client, servers, ledger and
     await shownRow(notificationId);
     openReview(notificationId);
     const reviewed = await waitFor(() => {
-      const text = row(notificationId)!.querySelector('.board-owner__review-lesson .board-owner__review-text')?.textContent;
+      const text = sheetLesson()?.querySelector('.board-lessons__text')?.textContent;
       if (text === undefined || text === null) throw new Error('review not loaded yet');
       return text;
     });
@@ -379,7 +380,7 @@ describe('lesson proposal roundtrip through the real client, servers, ledger and
     await shownRow(notificationId);
     openReview(notificationId);
     await waitFor(() => {
-      if (row(notificationId)!.querySelector('.board-owner__review-lesson') === null) throw new Error('review not loaded yet');
+      if (sheetLesson() === null) throw new Error('review not loaded yet');
     });
     const button = (kind: 'accept' | 'reject'): HTMLButtonElement => row(notificationId)!.querySelector<HTMLButtonElement>(`.board-owner__${kind}`)!;
 
@@ -408,7 +409,7 @@ describe('lesson proposal roundtrip through the real client, servers, ledger and
     await turnEnd();
     await waitFor(() => {
       if (wire.openProposalGets() !== 0) throw new Error('the mandated reload is still outstanding');
-      if (row(notificationId)!.querySelector('.board-owner__review-lesson') === null) throw new Error('the reviewed text is not restored yet');
+      if (sheetLesson() === null) throw new Error('the reviewed text is not restored yet');
     });
     expect(button('accept').disabled).toBe(false);
 
@@ -455,7 +456,7 @@ describe('lesson proposal roundtrip through the real client, servers, ledger and
       await shownRow(notificationId);
       openReview(notificationId);
       await waitFor(() => {
-        if (row(notificationId)!.querySelector('.board-owner__review-lesson') === null) throw new Error('review not loaded yet');
+        if (sheetLesson() === null) throw new Error('review not loaded yet');
       });
       const button = (kind: 'accept' | 'reject'): HTMLButtonElement => row(notificationId)!.querySelector<HTMLButtonElement>(`.board-owner__${kind}`)!;
       const label = attempted === 'accept' ? 'Accept' : 'Reject';
@@ -502,7 +503,7 @@ describe('lesson proposal roundtrip through the real client, servers, ledger and
     await shownRow(notificationId);
     openReview(notificationId);
     await waitFor(() => {
-      if (row(notificationId)!.querySelector('.board-owner__review-lesson') === null) throw new Error('review not loaded yet');
+      if (sheetLesson() === null) throw new Error('review not loaded yet');
     });
     const button = (kind: 'accept' | 'reject'): HTMLButtonElement => row(notificationId)!.querySelector<HTMLButtonElement>(`.board-owner__${kind}`)!;
     wire.dropPosts(true);

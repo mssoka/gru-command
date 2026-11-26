@@ -2577,13 +2577,6 @@ body {
   overflow-wrap: anywhere;
 }
 
-.board-owner__consequence {
-  grid-area: note;
-  color: var(--muted);
-  overflow-wrap: anywhere;
-  font-size: 12px;
-}
-
 .board-owner__context,
 .board-owner__pointer-text {
   /* Own named track: sharing `meta` with the label stacked the prose ON
@@ -2593,11 +2586,6 @@ body {
   overflow-wrap: anywhere;
   font-size: 12px;
   line-height: 1.4;
-}
-
-.board-owner__review-body {
-  margin-top: 4px;
-  min-width: 0;
 }
 
 .board-owner__ack,
@@ -2626,18 +2614,6 @@ body {
   cursor: default;
 }
 
-/* Book of Lessons proposal (owner decision 2026-10-07): the review spans
-   the row under the copy; Accept/Reject sit together in the action slot. */
-.board-owner__row--proposal {
-  grid-template-areas:
-    'title action'
-    'meta action'
-    'context action'
-    'note action'
-    'review review'
-    'error error';
-}
-
 .board-owner__error {
   grid-area: error;
   margin-top: 6px;
@@ -2645,50 +2621,6 @@ body {
   font-weight: 700;
   color: var(--alert);
   overflow-wrap: anywhere;
-}
-
-.board-owner__actions {
-  grid-area: action;
-  display: flex;
-  gap: 6px;
-  align-self: center;
-}
-
-.board-owner__review {
-  grid-area: review;
-  margin-top: 6px;
-  min-width: 0;
-}
-
-.board-owner__review > summary {
-  cursor: pointer;
-  font-size: 12px;
-  font-weight: 700;
-}
-
-.board-owner__review-chapter {
-  margin-top: 8px;
-}
-
-.board-owner__review-heading {
-  font-weight: 800;
-  font-size: 12px;
-}
-
-.board-owner__review-lesson {
-  margin-top: 6px;
-  padding-left: 8px;
-  border-left: 2px solid color-mix(in srgb, var(--line) 40%, transparent);
-}
-
-.board-owner__review-text {
-  white-space: pre-wrap;
-  overflow-wrap: anywhere;
-  font-size: 12px;
-}
-
-.board-owner__review-text--before {
-  color: var(--muted);
 }
 
 .board-owner__open {
@@ -2742,25 +2674,667 @@ body {
     row-gap: 6px;
   }
 
-  /* A proposal row keeps its review area in the single column — without
-     it the review becomes an implicit column and squeezes the title. */
-  .board-owner__row--proposal {
-    grid-template-areas:
-      'title'
-      'meta'
-      'context'
-      'note'
-      'review'
-      'action'
-      'error';
-  }
-
   .board-owner__ack,
   .board-owner__open,
   .board-owner__goto,
   .board-owner__nolink {
     justify-self: start;
   }
+}
+
+/* ── Book of Lessons proposal (owner redesign 2026-11-26) ──────────────
+ * The FOR YOU card wears look A: a coral strip (a question only the owner
+ * can answer), the story, counts and "Things to check" on the left, the
+ * owner's call on the right; they stack on a narrow surface. The full
+ * review opens in a sheet over the board. */
+.board-lessons {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  grid-template-areas: none;
+  gap: 0;
+  margin: 6px 0;
+  padding: 0;
+  overflow: hidden;
+  border: var(--outline-thin);
+  border-radius: var(--radius-md);
+  background: var(--soft);
+  color: var(--ink);
+}
+
+.board-lessons:last-child {
+  border-bottom: var(--outline-thin);
+}
+
+.board-lessons > * {
+  grid-area: auto;
+  min-width: 0;
+}
+
+.board-lessons__strip {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px 10px;
+  min-width: 0;
+  padding: 10px 14px;
+  background: var(--alert);
+  color: var(--on-state);
+}
+
+.board-lessons__strip .board-lessons__kind {
+  flex: 0 1 auto;
+  min-width: 0;
+  max-width: 100%;
+  background: var(--paper);
+  color: var(--ink);
+  white-space: normal;
+  overflow-wrap: anywhere;
+}
+
+.board-lessons__strip .board-lessons__headline {
+  grid-area: auto;
+  flex: 1 1 240px;
+  font-size: 16px;
+  line-height: 1.3;
+  color: var(--on-state);
+}
+
+.board-lessons__strip .board-lessons__when {
+  grid-area: auto;
+  flex: 0 1 auto;
+  min-width: 0;
+  color: var(--on-state);
+}
+
+.board-lessons__body {
+  display: grid;
+  /* Two columns at most (each at least 40% wide), one when the surface
+     cannot give each 320px. */
+  grid-template-columns: repeat(auto-fit, minmax(min(100%, max(320px, 40%)), 1fr));
+  gap: 14px 28px;
+  padding: 14px;
+}
+
+.board-lessons__body > * {
+  min-width: 0;
+}
+
+.board-lessons__story,
+.board-lessons__call {
+  display: grid;
+  gap: 10px;
+  align-content: start;
+}
+
+.board-lessons__story .board-lessons__context {
+  grid-area: auto;
+  max-width: 68ch;
+  color: var(--ink);
+  font-size: 14px;
+  line-height: 1.55;
+}
+
+.board-lessons__quiet {
+  color: var(--muted);
+  font-size: 13px;
+  line-height: 1.5;
+}
+
+.board-lessons__tally {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.board-lessons__count,
+.board-lessons__badge {
+  display: inline-flex;
+  align-items: center;
+  border: 2px solid var(--line);
+  border-radius: 999px;
+  color: var(--on-state);
+  font-weight: 800;
+  white-space: nowrap;
+}
+
+.board-lessons__count {
+  padding: 3px 10px;
+  font-size: 12px;
+}
+
+.board-lessons__badge {
+  padding: 1px 9px;
+  font-size: 11px;
+}
+
+.board-lessons__count--new,
+.board-lessons__badge--new {
+  background: var(--done);
+}
+
+.board-lessons__count--updated,
+.board-lessons__badge--updated {
+  background: var(--rev);
+}
+
+.board-lessons__count--removed,
+.board-lessons__badge--removed {
+  background: var(--alert);
+}
+
+.board-lessons__count--cut,
+.board-lessons__badge--cut {
+  background: var(--band-needs-you);
+}
+
+.board-lessons__count--chapter,
+.board-lessons__badge--chapter {
+  background: var(--perkins);
+}
+
+.board-lessons__count--zero {
+  border-style: dashed;
+  background: var(--card);
+  color: var(--muted);
+  font-weight: 700;
+}
+
+.board-lessons__check {
+  display: grid;
+  gap: 6px;
+  padding: 10px 12px;
+  border: var(--outline-thin);
+  border-radius: var(--radius-sm);
+  background: var(--card);
+  color: var(--ink);
+}
+
+.board-lessons__check--calm {
+  border-style: dashed;
+  color: var(--muted);
+  font-size: 13px;
+}
+
+.board-lessons__check-title {
+  font-size: 14px;
+  font-weight: 800;
+}
+
+.board-lessons__check-list {
+  display: grid;
+  gap: 4px;
+  margin: 0;
+  padding-left: 20px;
+  font-size: 13px;
+  line-height: 1.5;
+  overflow-wrap: anywhere;
+}
+
+.board-lessons__question {
+  color: var(--ink);
+  font-size: 18px;
+  font-weight: 800;
+  line-height: 1.3;
+}
+
+.board-lessons__see,
+.board-lessons__retry {
+  justify-self: start;
+  padding: 9px 16px;
+  border: var(--outline-thin);
+  border-radius: var(--radius-sm);
+  background: var(--work);
+  color: var(--on-state);
+  box-shadow: var(--shadow-btn);
+  font-size: 14px;
+  font-weight: 800;
+  cursor: pointer;
+}
+
+.board-lessons__see:disabled {
+  opacity: 0.6;
+  cursor: default;
+  box-shadow: none;
+}
+
+.board-lessons__choices {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(min(100%, 200px), 1fr));
+  gap: 10px;
+}
+
+.board-lessons__choice {
+  display: grid;
+  gap: 8px;
+  align-content: start;
+  min-width: 0;
+  padding: 12px;
+  border: var(--outline-thin);
+  border-radius: var(--radius-sm);
+  background: var(--card);
+}
+
+.board-lessons__consequence {
+  color: var(--muted);
+  font-size: 13px;
+  line-height: 1.45;
+  overflow-wrap: anywhere;
+}
+
+.board-lessons__consequence--both {
+  grid-column: 1 / -1;
+}
+
+.board-lessons__accept,
+.board-lessons__reject {
+  justify-self: start;
+  padding: 8px 14px;
+  border: var(--outline);
+  border-radius: var(--radius-sm);
+  background: var(--card);
+  color: var(--ink);
+  box-shadow: var(--shadow-btn);
+  font-size: 14px;
+  font-weight: 800;
+  white-space: nowrap;
+  cursor: pointer;
+}
+
+.board-lessons__accept {
+  background: var(--done);
+  color: var(--on-state);
+}
+
+.board-lessons__accept:disabled,
+.board-lessons__reject:disabled {
+  opacity: 0.6;
+  cursor: default;
+  box-shadow: none;
+}
+
+.board-lessons > .board-lessons__message {
+  margin: 0 14px 12px;
+}
+
+/* The review sheet: a modal dialog over the board, full width on a phone.
+   Its header (counts, filters) and foot (Accept all / Reject all) stay put
+   while the changes scroll between them. Sized in percentages of the
+   screen: under CSS zoom, viewport units and fixed caps grow with the zoom
+   and pushed the foot off screen. */
+.board-lessons-sheet {
+  width: min(1100px, calc(100% - 24px));
+  max-width: none;
+  height: min(92%, 1000px);
+  max-height: none;
+  margin: auto;
+  padding: 0;
+  overflow: hidden;
+  border: var(--outline);
+  border-radius: var(--radius-lg);
+  background: var(--paper);
+  color: var(--ink);
+  box-shadow: var(--shadow-card);
+}
+
+.board-lessons-sheet::backdrop {
+  background: rgba(20, 26, 43, 0.55);
+}
+
+.board-lessons-sheet__frame {
+  display: grid;
+  grid-template-rows: auto minmax(0, 1fr) auto;
+  height: 100%;
+}
+
+.board-lessons-sheet__frame > * {
+  min-width: 0;
+}
+
+.board-lessons-sheet__top {
+  display: grid;
+  gap: 10px;
+  /* On a short screen the header and the foot scroll themselves, so the
+     changes keep room and Accept all / Reject all stay reachable. */
+  max-height: 40dvh;
+  overflow-y: auto;
+  padding: 14px 16px 12px;
+  border-bottom: var(--outline-thin);
+  background: var(--card);
+}
+
+.board-lessons-sheet__title-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px 12px;
+}
+
+.board-lessons-sheet__title {
+  flex: 1 1 240px;
+  min-width: 0;
+  margin: 0;
+  font-size: 18px;
+  font-weight: 800;
+  line-height: 1.3;
+  overflow-wrap: anywhere;
+}
+
+.board-lessons-sheet__close {
+  padding: 6px 12px;
+  border: var(--outline-thin);
+  border-radius: 999px;
+  background: var(--soft);
+  color: var(--ink);
+  font-size: 13px;
+  font-weight: 800;
+  cursor: pointer;
+}
+
+.board-lessons-sheet__filters {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.board-lessons-sheet__filter {
+  padding: 4px 11px;
+  border: 2px solid var(--line);
+  border-radius: 999px;
+  background: var(--soft);
+  color: var(--ink);
+  font-size: 12px;
+  font-weight: 800;
+  cursor: pointer;
+}
+
+.board-lessons-sheet__filter[aria-pressed='true'] {
+  border-color: var(--ink);
+  background: var(--ink);
+  color: var(--paper);
+}
+
+.board-lessons-sheet__body {
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  padding: 16px;
+}
+
+.board-lessons-sheet__foot {
+  max-height: 45dvh;
+  overflow-y: auto;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px 14px;
+  padding: 12px 16px;
+  border-top: var(--outline-thin);
+  background: var(--card);
+}
+
+.board-lessons-sheet__hint {
+  flex: 1 1 240px;
+  min-width: 0;
+  color: var(--muted);
+  font-size: 13px;
+}
+
+.board-lessons-sheet__foot .board-lessons-sheet__message {
+  flex: 1 1 100%;
+  margin: 0;
+}
+
+.board-lessons-sheet__actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+}
+
+@media (max-width: 560px) {
+  .board-lessons-sheet {
+    width: 100%;
+    height: 100%;
+    max-height: 100%;
+    border-width: 0;
+    border-radius: 0;
+  }
+}
+
+.board-lessons__changes {
+  display: grid;
+  gap: 22px;
+}
+
+.board-lessons__changes > *,
+.board-lessons__chapter > * {
+  min-width: 0;
+}
+
+.board-lessons__chapter {
+  display: grid;
+  gap: 12px;
+}
+
+.board-lessons__chapter-head {
+  display: grid;
+  gap: 6px;
+  padding-bottom: 8px;
+  border-bottom: 2px dashed color-mix(in srgb, var(--muted) 45%, transparent);
+}
+
+.board-lessons__chapter-title,
+.board-lessons__lesson-head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px 10px;
+}
+
+.board-lessons__chapter-name {
+  min-width: 0;
+  margin: 0;
+  font-size: 17px;
+  font-weight: 800;
+  overflow-wrap: anywhere;
+}
+
+.board-lessons__lesson {
+  display: grid;
+  gap: 10px;
+  min-width: 0;
+  padding: 12px 14px;
+  border: var(--outline-thin);
+  border-left-width: 8px;
+  border-radius: var(--radius-md);
+  background: var(--card);
+}
+
+.board-lessons__lesson > * {
+  min-width: 0;
+}
+
+.board-lessons__lesson--new {
+  border-left-color: var(--done);
+}
+
+.board-lessons__lesson--updated {
+  border-left-color: var(--rev);
+}
+
+.board-lessons__lesson--removed {
+  border-left-color: var(--alert);
+}
+
+.board-lessons__lesson--cut {
+  border-left-color: var(--band-needs-you);
+}
+
+.board-lessons__lesson-name {
+  flex: 1 1 200px;
+  min-width: 0;
+  margin: 0;
+  font-size: 15px;
+  font-weight: 800;
+  overflow-wrap: anywhere;
+}
+
+.board-lessons__why {
+  color: var(--muted);
+  font-size: 13px;
+}
+
+.board-lessons__why b {
+  color: var(--ink);
+}
+
+.board-lessons__size {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-weight: 700;
+  white-space: nowrap;
+}
+
+.board-lessons__size::before {
+  content: '';
+  width: 40px;
+  height: 7px;
+  border-radius: 4px;
+  background: linear-gradient(to right, var(--rev) var(--fill), color-mix(in srgb, var(--muted) 30%, transparent) var(--fill));
+}
+
+.board-lessons__size--small {
+  --fill: 20%;
+}
+
+.board-lessons__size--some {
+  --fill: 55%;
+}
+
+.board-lessons__size--rewritten {
+  --fill: 90%;
+}
+
+.board-lessons__text {
+  margin: 0;
+  font-size: 14.5px;
+  line-height: 1.65;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.board-lessons__text--gone {
+  color: var(--muted);
+  text-decoration: line-through;
+}
+
+.board-lessons__ins,
+.board-lessons__del {
+  border-radius: 4px;
+  padding: 1px 2px;
+  box-decoration-break: clone;
+  -webkit-box-decoration-break: clone;
+}
+
+.board-lessons__ins {
+  background: var(--diff-ins-bg);
+  color: var(--diff-ins-ink);
+  text-decoration: none;
+}
+
+.board-lessons__del {
+  background: var(--diff-del-bg);
+  color: var(--diff-del-ink);
+  text-decoration: line-through;
+}
+
+.board-lessons__cutmark {
+  display: inline-block;
+  margin-left: 6px;
+  padding: 1px 9px;
+  border-radius: 999px;
+  background: var(--band-needs-you);
+  color: var(--on-state);
+  font-size: 12px;
+  font-weight: 800;
+  white-space: nowrap;
+}
+
+.board-lessons__pair {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(min(100%, 260px), 1fr));
+  gap: 10px;
+}
+
+.board-lessons__side {
+  display: grid;
+  gap: 6px;
+  align-content: start;
+  min-width: 0;
+  padding: 10px 12px;
+  border-radius: var(--radius-sm);
+  background: var(--soft);
+}
+
+.board-lessons__side-label {
+  color: var(--faint);
+  font-size: 11px;
+  font-weight: 800;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+}
+
+.board-lessons__labels,
+.board-lessons__line {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 4px 8px;
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.board-lessons__labels-name,
+.board-lessons__line-name {
+  font-weight: 700;
+}
+
+.board-lessons__label {
+  padding: 0 7px;
+  border-radius: 999px;
+  background: var(--soft);
+  color: var(--ink);
+  font-weight: 700;
+}
+
+.board-lessons__line-text {
+  min-width: 0;
+  color: var(--ink);
+  font-size: 14px;
+  overflow-wrap: anywhere;
+}
+
+.board-lessons__toc-entry {
+  display: grid;
+  gap: 6px;
+  padding: 10px 12px;
+  border: var(--outline-thin);
+  border-radius: var(--radius-md);
+  background: var(--card);
+}
+
+.board-lessons__toc-name {
+  font-size: 14px;
+  font-weight: 800;
+}
+
+.board-lessons__housekeeping {
+  margin: 0;
+  padding-top: 12px;
+  border-top: 2px dashed color-mix(in srgb, var(--muted) 45%, transparent);
+  color: var(--muted);
+  font-size: 13px;
 }
 
 .board-band__more:hover {

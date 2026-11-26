@@ -9,9 +9,11 @@ import {
 } from '../src/lib/board-protocol.js';
 
 /**
- * Book of Lessons proposal on a phone (owner decision 2026-10-07): the For
- * You row with its review disclosure OPEN must stay one column, inside the
- * viewport, with Accept and Reject reachable. Measured in a real browser
+ * Book of Lessons proposal on a phone (owner decision 2026-10-07; review
+ * redesign 2026-11-26): the For You card stays one column inside the
+ * viewport, its review sheet fills the phone and scrolls only vertically,
+ * and Accept all / Reject all are reachable in the sheet's foot and on the
+ * card. Measured in a real browser
  * layout, not read from CSS text. Synthetic fixtures on the board's two
  * channels (`/board/ws` push and `GET /api/board`) plus the review fetch;
  * pairing runs against the real dev mock. No decision is ever clicked.
@@ -147,7 +149,7 @@ interface Box {
 }
 
 for (const width of [360, 375, 390]) {
-  test(`the open proposal review stays one column and reachable at ${width}px`, async ({ page }) => {
+  test(`the proposal card stays one column and its review sheet fills the phone with Accept all / Reject all reachable at ${width}px`, async ({ page }) => {
     await page.setViewportSize({ width, height: 800 });
     const { pageErrors, decisions } = await seed(page);
     await page.goto('/');
@@ -158,47 +160,71 @@ for (const width of [360, 375, 390]) {
 
     const row = page.locator('#board-owner .board-owner__row--proposal');
     await expect(row).toBeVisible();
-    await row.locator('.board-owner__review > summary').click();
-    await expect(row.locator('.board-owner__review-text').first()).toContainText('Close the live shell');
+    // The card reads its review on its own and shows the counts.
+    await expect(row.locator('.board-lessons__tally')).toContainText('+ 1 new');
 
-    const geometry = await row.evaluate((node) => {
+    const card = await row.evaluate((node) => {
       const box = (element: Element | null): Box | null => {
         if (element === null) return null;
         const rect = element.getBoundingClientRect();
         return { left: rect.left, right: rect.right, top: rect.top, bottom: rect.bottom, width: rect.width };
       };
-      const parts = ['.board-owner__title', '.board-owner__meta', '.board-owner__consequence', '.board-owner__review', '.board-owner__actions'].map(
-        (selector) => box(node.querySelector(`:scope > ${selector}`)),
-      );
+      const body = node.querySelector('.board-lessons__body')!;
+      const parts = ['.board-lessons__strip', '.board-lessons__story', '.board-lessons__call'].map((selector) => box(node.querySelector(selector)));
       return {
         row: box(node)!,
         parts,
-        columns: getComputedStyle(node).gridTemplateColumns.trim().split(/\s+/u).length,
+        columns: getComputedStyle(body).gridTemplateColumns.trim().split(/\s+/u).length,
         rowOverflow: node.scrollWidth - node.clientWidth,
         pageOverflow: document.documentElement.scrollWidth - document.documentElement.clientWidth,
         viewport: window.innerWidth,
       };
     });
-    expect(geometry.columns).toBe(1);
-    expect(geometry.parts.every((part) => part !== null)).toBe(true);
-    const parts = geometry.parts as Box[];
+    expect(card.columns).toBe(1);
+    expect(card.parts.every((part) => part !== null)).toBe(true);
+    const parts = card.parts as Box[];
     // Stacked in one column: each part starts below the previous one and
     // sits inside the row, which sits inside the viewport.
     for (let index = 1; index < parts.length; index += 1) expect(parts[index]!.top).toBeGreaterThanOrEqual(parts[index - 1]!.bottom - 1);
     for (const part of parts) {
-      expect(part.left).toBeGreaterThanOrEqual(geometry.row.left - 1);
-      expect(part.right).toBeLessThanOrEqual(geometry.row.right + 1);
+      expect(part.left).toBeGreaterThanOrEqual(card.row.left - 1);
+      expect(part.right).toBeLessThanOrEqual(card.row.right + 1);
     }
     expect(parts[0]!.width).toBeGreaterThan(0);
-    expect(geometry.row.left).toBeGreaterThanOrEqual(0);
-    expect(geometry.row.right).toBeLessThanOrEqual(geometry.viewport);
-    expect(geometry.rowOverflow).toBeLessThanOrEqual(0);
-    expect(geometry.pageOverflow).toBeLessThanOrEqual(0);
+    expect(card.row.left).toBeGreaterThanOrEqual(0);
+    expect(card.row.right).toBeLessThanOrEqual(card.viewport);
+    expect(card.rowOverflow).toBeLessThanOrEqual(0);
+    expect(card.pageOverflow).toBeLessThanOrEqual(0);
 
-    // Accept and Reject: on screen and the topmost element at their centres.
-    for (const selector of ['.board-owner__accept', '.board-owner__reject']) {
-      const button = row.locator(selector);
-      await button.scrollIntoViewIfNeeded();
+    // The review opens over the board, the whole phone wide and high; its
+    // long text scrolls inside it, never sideways.
+    await row.locator('.board-lessons__see').click();
+    const sheet = page.locator('dialog.board-lessons-sheet');
+    await expect(sheet).toBeVisible();
+    await expect(sheet.locator('.board-lessons__text').first()).toContainText('Close the live shell');
+    const fit = await sheet.evaluate((node) => {
+      const rect = node.getBoundingClientRect();
+      const body = node.querySelector('.board-lessons-sheet__body')!;
+      return {
+        left: rect.left,
+        right: rect.right,
+        top: rect.top,
+        bottom: rect.bottom,
+        viewport: { width: window.innerWidth, height: window.innerHeight },
+        bodyOverflowX: body.scrollWidth - body.clientWidth,
+        bodyScrolls: body.scrollHeight > body.clientHeight,
+      };
+    });
+    expect(fit.left).toBeGreaterThanOrEqual(-1);
+    expect(fit.top).toBeGreaterThanOrEqual(-1);
+    expect(fit.right).toBeLessThanOrEqual(fit.viewport.width + 1);
+    expect(fit.bottom).toBeLessThanOrEqual(fit.viewport.height + 1);
+    expect(fit.right - fit.left).toBeGreaterThanOrEqual(fit.viewport.width - 2);
+    expect(fit.bodyOverflowX).toBeLessThanOrEqual(0);
+
+    // Accept all and Reject all: on screen at the sheet's foot without
+    // scrolling, and the topmost element at their centres.
+    const hitTest = async (button: import('@playwright/test').Locator): Promise<void> => {
       await expect(button).toBeEnabled();
       const hit = await button.evaluate((node) => {
         const rect = node.getBoundingClientRect();
@@ -207,6 +233,17 @@ for (const width of [360, 375, 390]) {
         return { inViewport, hit: top === node || node.contains(top) };
       });
       expect(hit).toEqual({ inViewport: true, hit: true });
+    };
+    for (const selector of ['.board-owner__accept', '.board-owner__reject']) await hitTest(sheet.locator(`.board-lessons-sheet__actions ${selector}`));
+
+    // Close returns to the card, whose own buttons are reachable too.
+    await sheet.locator('.board-lessons-sheet__close').click();
+    await expect(sheet).toBeHidden();
+    await expect(row.locator('.board-lessons__see')).toBeFocused();
+    for (const selector of ['.board-owner__accept', '.board-owner__reject']) {
+      const button = row.locator(selector);
+      await button.scrollIntoViewIfNeeded();
+      await hitTest(button);
     }
     expect(decisions).toEqual([]);
     expect(pageErrors).toEqual([]);

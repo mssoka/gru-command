@@ -1173,8 +1173,9 @@ export function serializeChapter(chapter: BibleChapter): string {
 const CHAPTER_META_LINE = /^(summary|tags):\s*(.*)$/;
 const LESSON_META_LINE = /^(recurred|provenance|tags):\s*(.*)$/;
 const HEADING_LINE = /^#{1,6}\s/;
-/** Marker appended to a body shortened by cap enforcement. */
-const TRIM_MARKER = ' … [trimmed to fit the chapter cap]';
+/** Marker appended to a body shortened by cap enforcement (the board's
+ * review mirrors it as LESSON_TRIM_MARKER to show a cut lesson as cut). */
+export const TRIM_MARKER =' … [trimmed to fit the chapter cap]';
 
 export function parseChapter(text: string, slug: string, contract: PlanContract = PLAN_CONTRACT): BibleChapter {
   if (!isLessonsSlug(slug)) throw new BibleError(`invalid chapter slug: ${JSON.stringify(slug)}`);

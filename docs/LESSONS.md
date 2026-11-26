@@ -60,6 +60,20 @@ The cursor only advances after a successful apply: a failed pass retries
 the same entries at the next beat. Nothing new = no distiller call = no
 model cost.
 
+**The owner decides every update** (owner decision 2026-10-07). A pass
+proposes instead of writing; nothing in the book changes until the owner
+accepts in FOR YOU. The card says what the update does in plain words
+(owner redesign 2026-11-26): a headline ("Gru wants to add 4 lessons and
+update 11"), counts of new, updated, removed and cut-short lessons, and a
+**Things to check** box that points at the parts worth a careful look —
+lessons the chapter cap cuts short, removals, new lessons left out,
+retired or renamed chapters, table-of-contents lines cut short. **See
+what changes** opens the full review: every chapter and lesson the Accept
+would write, each reworded lesson with its changes marked word by word
+(in place for an edit, before and after side by side for a rewrite).
+**Accept all** writes the update; **Reject all** keeps the book as it is
+and consumes the batch.
+
 ### 3. Bible (format)
 
 Under `<data_dir>/bible/`:
