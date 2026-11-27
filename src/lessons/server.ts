@@ -152,8 +152,23 @@ export function createLessonsServer(options: LessonsServerOptions): LessonsServe
       const id = decodeURIComponent(decision[1] ?? '');
       const proposals = requireProposals();
       const kind = decision[2] === 'accept' ? 'accepted' : 'rejected';
+      // "Save my choices" (owner request 2026-11-26): an Accept may carry
+      // the changes the owner dropped, as {"drop": ["<chapter>/<lesson>" |
+      // "<chapter>", ...]}. An empty body is Accept all / Reject all.
+      let drop: string[];
       try {
-        json(res, 200, kind === 'accepted' ? proposals.accept(id) : proposals.reject(id));
+        const body = await readBody(req);
+        const raw = body['drop'] ?? [];
+        if (!Array.isArray(raw) || raw.some((key) => typeof key !== 'string' || key === '') || raw.length > 1000) {
+          throw new Error('"drop" must be a list of change keys');
+        }
+        drop = raw as string[];
+      } catch (error) {
+        json(res, 400, { error: 'proposal_choices', detail: error instanceof Error ? error.message : String(error) });
+        return true;
+      }
+      try {
+        json(res, 200, kind === 'accepted' ? proposals.accept(id, drop) : proposals.reject(id, drop));
       } catch (error) {
         if (!(error instanceof ProposalError)) {
           // Storage or integrity trouble is not a refusal (C8): the decision
@@ -168,7 +183,7 @@ export function createLessonsServer(options: LessonsServerOptions): LessonsServe
           json(res, 202, { id, decision: kind, incomplete: true, detail: error.message });
           return true;
         }
-        json(res, error.code === 'none' ? 404 : 409, { error: `proposal_${error.code}`, detail: error.message });
+        json(res, error.code === 'none' ? 404 : error.code === 'choices' ? 400 : 409, { error: `proposal_${error.code}`, detail: error.message });
       }
       return true;
     }

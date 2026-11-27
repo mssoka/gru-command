@@ -18,8 +18,9 @@ This is the written standard the code enforces (issue #570). The boundary is
    why the owner is seeing it, what happens if they do nothing, and the
    manual step. A notice never grows a control of its own.
 
-A third row type, the **Book of Lessons proposal**, is decided with
-Accept/Reject on the proposal itself; its notice still has to read plainly.
+A third row type, the **Book of Lessons proposal**, is decided on the
+proposal itself — Accept all, Reject all, or Keep / Drop per change and
+Save my choices (see LESSONS.md); its notice still has to read plainly.
 
 ## Required fields
 

@@ -290,6 +290,35 @@ describe('lesson proposals over HTTP (owner decision 2026-10-07)', () => {
     }
   });
 
+  it('Save my choices over HTTP: Accept carries the dropped changes; a malformed or unknown drop is 400 with nothing recorded', async () => {
+    const h = await boot();
+    try {
+      const { id, notificationId } = await propose(h);
+      const review = await call(h.port, 'GET', '/api/lessons/proposal', undefined, TOKEN);
+      expect((review.json as { chapters: { added: { byWriter: boolean }[] }[] }).chapters[0]!.added[0]!.byWriter).toBe(true);
+      for (const body of [{ drop: 'ops-restarts/shell-hang' }, { drop: [7] }, { drop: [''] }]) {
+        const refused = await call(h.port, 'POST', `/api/lessons/proposal/${id}/accept`, body, TOKEN);
+        expect(refused.status, JSON.stringify(body)).toBe(400);
+        expect(refused.json, JSON.stringify(body)).toMatchObject({ error: 'proposal_choices', detail: '"drop" must be a list of change keys' });
+      }
+      const unknown = await call(h.port, 'POST', `/api/lessons/proposal/${id}/accept`, { drop: ['ops-restarts/not-there'] }, TOKEN);
+      expect(unknown.status).toBe(400);
+      expect(unknown.json).toMatchObject({ error: 'proposal_choices' });
+      const rejectWithChoices = await call(h.port, 'POST', `/api/lessons/proposal/${id}/reject`, { drop: ['ops-restarts/shell-hang'] }, TOKEN);
+      expect(rejectWithChoices.status).toBe(400);
+      expect(h.proposals.review()).toMatchObject({ id, decision: null });
+      // Dropping the only change of a new chapter: accepted, nothing created, batch consumed.
+      const kept = await call(h.port, 'POST', `/api/lessons/proposal/${id}/accept`, { drop: ['ops-restarts/shell-hang'] }, TOKEN);
+      expect(kept.status).toBe(200);
+      expect(kept.json).toMatchObject({ id, decision: 'accepted', coveredThroughSeq: 1 });
+      expect(h.bible.readChapter('ops-restarts')).toBeNull();
+      expect(cursor(h.bible)).toBe(1);
+      expect(h.ledger.getNotification(notificationId)?.resolvedBy).toBe('owner:accepted');
+    } finally {
+      await h.close();
+    }
+  });
+
   it('Reject over HTTP leaves the book byte-identical, consumes the batch, resolves the row; every route needs the token', async () => {
     const h = await boot();
     try {

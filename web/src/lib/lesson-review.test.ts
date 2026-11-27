@@ -3,6 +3,8 @@ import { LESSON_TRIM_MARKER, type LessonChangeView, type LessonProposalView } fr
 import {
   REWRITE_RATIO,
   analyseProposal,
+  droppableKeys,
+  lostTail,
   changeSize,
   isCutOnly,
   lessonDiff,
@@ -183,5 +185,29 @@ describe('lessonName', () => {
   it('turns a slug into a sentence and says what the archive record is', () => {
     expect(lessonName('wall-means-wait-not-restart')).toBe('Wall means wait not restart');
     expect(lessonName('archived-provenance')).toBe('Archive record (where dropped lessons came from)');
+  });
+});
+
+describe('which changes the owner may drop', () => {
+  it('exactly the ones the server names — and none from a server that names none', () => {
+    expect(droppableKeys(review({ choices: ['gates/new-one', 'gone'] }))).toEqual(['gates/new-one', 'gone']);
+    // An older server would ignore a drop and accept everything: offer nothing.
+    expect(droppableKeys(review())).toEqual([]);
+  });
+
+  it('the flag wins over the text test: a tags-only update that is also cut is still an update', () => {
+    expect(isCutOnly({ ...changed('t', 'Long text here.', `Long text${LESSON_TRIM_MARKER}`, { recurred: 1, previousRecurred: 1 }), byWriter: true })).toBe(false);
+    expect(isCutOnly({ ...changed('t', 'Long text here.', `Long text${LESSON_TRIM_MARKER}`, { recurred: 1, previousRecurred: 1 }), byWriter: false })).toBe(true);
+  });
+
+  it('a cut lesson names the text it loses, from the whole text the server sent', () => {
+    const cutLesson = (fullBody: string | null | undefined) => ({
+      slug: 'n', body: `Drain the queue,${LESSON_TRIM_MARKER}`, recurred: 1, tags: [], previousBody: null, previousRecurred: null, previousTags: null,
+      ...(fullBody === undefined ? {} : { fullBody }),
+    });
+    expect(lostTail(cutLesson('Drain the queue, then wait for every job.'))).toBe(' then wait for every job.');
+    expect(lostTail(cutLesson(null))).toBeNull();
+    expect(lostTail(cutLesson(undefined))).toBeNull();
+    expect(lostTail({ ...cutLesson('x'), body: 'Not cut.' })).toBeNull();
   });
 });

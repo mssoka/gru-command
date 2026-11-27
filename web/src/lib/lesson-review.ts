@@ -147,6 +147,8 @@ export function isCutOnly(lesson: LessonChangeView): boolean {
   if (lesson.previousBody === null) return false;
   const { text, cut } = splitCut(lesson.body);
   if (!cut) return false;
+  // The server knows exactly who changed it; the text test is the fallback.
+  if (lesson.byWriter !== undefined) return !lesson.byWriter;
   if (lesson.previousRecurred !== lesson.recurred) return false;
   return splitCut(lesson.previousBody).text.trimEnd().startsWith(text.trimEnd());
 }
@@ -318,3 +320,27 @@ export function labelChanges(before: readonly string[], after: readonly string[]
 }
 
 
+
+/** The key "Save my choices" sends to drop a lesson change
+ * (`<chapter>/<lesson>`) or a chapter's retirement (`<chapter>`). */
+export function changeKey(chapterSlug: string, lessonSlug?: string): string {
+  return lessonSlug === undefined ? chapterSlug : `${chapterSlug}/${lessonSlug}`;
+}
+
+/** Every change of a proposal the owner may drop, by key — exactly the
+ * list the server names (it re-plans only those). A server that names none
+ * (one that predates Keep / Drop) offers none: a drop it would ignore must
+ * never be sent. */
+export function droppableKeys(review: LessonProposalView): string[] {
+  return [...(review.choices ?? [])];
+}
+
+/** The text a cut lesson loses: the rest of its whole text after the cut
+ * (null when it is not cut, or the server did not send the whole text). */
+export function lostTail(lesson: LessonChangeView): string | null {
+  const { text, cut } = splitCut(lesson.body);
+  if (!cut || lesson.fullBody === undefined || lesson.fullBody === null) return null;
+  const kept = text.trimEnd();
+  const tail = lesson.fullBody.startsWith(kept) ? lesson.fullBody.slice(kept.length) : null;
+  return tail === null || tail.trim() === '' ? null : tail;
+}

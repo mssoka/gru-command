@@ -2,8 +2,8 @@ import { randomUUID } from 'node:crypto';
 import { existsSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 import type { LogLevel } from '../logger.js';
-import { BibleLockReleaseError, checkPlan, describePlan, type ApplyReport, type BiblePlan, type BibleStore, type PlanReview } from './bible.js';
-import { DreamError, isLessonsSlug, ProposalError, type JournalEntry, type ProposedChapter } from './types.js';
+import { BibleLockReleaseError, checkPlan, describePlan, PLAN_CONTRACT, planChoices, replanWithout, unseenLosses, type ApplyReport, type BiblePlan, type BibleStore, type PlanReview } from './bible.js';
+import { BibleError, DreamError, isLessonsSlug, ProposalError, type JournalEntry, type ProposedChapter } from './types.js';
 import { ownerNoticeWithFallback } from '../notifications/owner-language.js';
 
 type Log = (level: LogLevel, msg: string, fields?: Record<string, unknown>) => void;
@@ -419,6 +419,10 @@ export interface LessonProposal {
     readonly kind: ProposalDecisionKind;
     readonly at: string;
     readonly detail: string | null;
+    /** The changes the owner dropped with "Save my choices" (sorted);
+     * absent for Accept all, Reject all and a withdrawal. The stored plan is
+     * then the re-planned one: exactly what the kept choices write. */
+    readonly dropped?: readonly string[];
   } | null;
   /** Why a recorded decision could not be carried out (the book or the
    * cursor changed under it). The record — and the owner's intent — stay
@@ -443,9 +447,12 @@ export interface LessonProposalReview {
   /** What the update is about, in one plain sentence (null when the
    * distiller wrote none). */
   readonly overview: string | null;
+  /** The changes the owner may drop with Keep / Drop (`<chapter>/<lesson>`
+   * or `<chapter>` for a retirement); empty once a decision is recorded. */
+  readonly choices: readonly string[];
   /** The owner's decision when it is recorded but not yet finished — the
    * same decision finishes it; the opposite one is refused. */
-  readonly decision: { readonly kind: 'accepted' | 'rejected'; readonly at: string } | null;
+  readonly decision: { readonly kind: 'accepted' | 'rejected'; readonly at: string; readonly dropped?: readonly string[] } | null;
   /** Why the recorded decision is blocked (see LessonProposal.recovery). */
   readonly recovery: { readonly conflict: string; readonly at: string } | null;
 }
@@ -582,7 +589,7 @@ export class LessonProposals {
     let recorded: LessonProposalReview['decision'] = null;
     if (decision !== null) {
       if (decision.kind === 'withdrawn') return null; // the next reconcile finishes it
-      recorded = { kind: decision.kind, at: decision.at };
+      recorded = { kind: decision.kind, at: decision.at, ...(decision.dropped !== undefined ? { dropped: decision.dropped } : {}) };
     }
     const review = describePlan(proposal.plan);
     return {
@@ -594,6 +601,9 @@ export class LessonProposals {
       chapters: review.chapters,
       index: review.index,
       overview: proposal.overview ?? null,
+      // What the owner may drop — only while undecided, and only for a plan
+      // today's planning contract can re-plan (an older one is decided whole).
+      choices: recorded === null && (proposal.plan.contract ?? 1) === PLAN_CONTRACT ? [...planChoices(proposal.plan)].sort() : [],
       decision: recorded,
       recovery: proposal.recovery,
     };
@@ -663,27 +673,43 @@ export class LessonProposals {
     return proposal;
   }
 
-  /** Owner Accept: write the planned update, then advance the cursor. */
-  accept(id: string): LessonProposalDecision {
-    return this.decide(id, 'accepted');
+  /** Owner Accept: write the planned update, then advance the cursor. With
+   * `drop` ("Save my choices", owner request 2026-11-26) the update is
+   * re-planned without the dropped changes first; when that would cut or
+   * remove anything the owner never saw, nothing is recorded or written
+   * (ProposalError 'overflow' names what). */
+  accept(id: string, drop: readonly string[] = []): LessonProposalDecision {
+    return this.decide(id, 'accepted', drop);
   }
 
-  /** Owner Reject: the book is untouched; the batch is consumed anyway. */
-  reject(id: string): LessonProposalDecision {
-    return this.decide(id, 'rejected');
+  /** Owner Reject: the book is untouched; the batch is consumed anyway. It
+   * takes no kept choices (a non-empty `drop` is refused as 'choices'). */
+  reject(id: string, drop: readonly string[] = []): LessonProposalDecision {
+    return this.decide(id, 'rejected', drop);
   }
 
-  private decide(id: string, kind: 'accepted' | 'rejected'): LessonProposalDecision {
+  private decide(id: string, kind: 'accepted' | 'rejected', drop: readonly string[] = []): LessonProposalDecision {
     const proposal = this.pending();
     if (proposal === null) throw new ProposalError('none', 'no lesson proposal is pending');
     if (proposal.id !== id) {
       throw new ProposalError('mismatch', `lesson proposal ${id} is not the pending one (${proposal.id})`);
     }
+    const dropped = [...new Set(drop)].sort();
+    if (kind === 'rejected' && dropped.length > 0) throw new ProposalError('choices', 'a Reject drops everything: it takes no choices');
     if (proposal.decision !== null) {
-      // The same decision retried resumes it; the opposite decision can
-      // never undo a recorded one.
+      // The same decision retried resumes it; the opposite decision — or an
+      // Accept with other kept choices — can never undo a recorded one.
       if (proposal.decision.kind !== kind) {
         throw new ProposalError('decided', `this lesson proposal was already ${proposal.decision.kind}`);
+      }
+      const recorded = proposal.decision.dropped ?? [];
+      if (recorded.join('\u0000') !== dropped.join('\u0000')) {
+        throw new ProposalError(
+          'decided',
+          recorded.length === 0
+            ? 'this lesson proposal was already accepted whole'
+            : `this lesson proposal was already accepted with ${recorded.length} change(s) dropped`,
+        );
       }
       return this.finishRecorded(proposal);
     }
@@ -692,8 +718,31 @@ export class LessonProposals {
       this.withdraw(proposal, stale);
       throw new ProposalError('stale', `${stale} — the proposal was withdrawn; the next dream re-proposes these journal entries`);
     }
-    const decided: LessonProposal = { ...proposal, decision: { kind, at: this.now().toISOString(), detail: null } };
-    this.write(decided); // the decision is durable BEFORE the book or cursor changes
+    let plan = proposal.plan;
+    if (dropped.length > 0) {
+      try {
+        plan = replanWithout(proposal.plan, new Set(dropped));
+      } catch (error) {
+        if (error instanceof BibleError) throw new ProposalError('choices', error.message);
+        throw error;
+      }
+      const losses = unseenLosses(proposal.plan, plan);
+      if (losses.length > 0) {
+        throw new ProposalError(
+          'overflow',
+          `nothing was written — with your choices ${losses.join('; ')}, which the review did not show. ` +
+            'Drop another change in that chapter, or accept all',
+        );
+      }
+    }
+    const decided: LessonProposal = {
+      ...proposal,
+      plan,
+      decision: { kind, at: this.now().toISOString(), detail: null, ...(dropped.length > 0 ? { dropped } : {}) },
+    };
+    validateLessonProposal(JSON.parse(JSON.stringify(decided)), 'decided proposal');
+    checkPlan(decided.plan);
+    this.write(decided); // the decision — and the plan it writes — is durable BEFORE the book or cursor changes
     return this.finishRecorded(decided);
   }
 
@@ -987,6 +1036,11 @@ function validateLessonProposal(value: unknown, where: string): LessonProposal {
     if (decision['kind'] !== 'accepted' && decision['kind'] !== 'rejected' && decision['kind'] !== 'withdrawn') fail('decision.kind');
     instant(decision['at'], 'decision.at');
     if (decision['detail'] !== null) text(decision['detail'], 'decision.detail');
+    if (decision['dropped'] !== undefined) {
+      const dropped = strings(decision['dropped'], 'decision.dropped');
+      if (decision['kind'] !== 'accepted' || dropped.length === 0) fail('decision.dropped');
+      if (dropped.join('\u0000') !== [...new Set(dropped)].sort().join('\u0000')) fail('decision.dropped order');
+    }
   }
   if (row['recovery'] !== null) {
     const recovery = record(row['recovery'], 'recovery');

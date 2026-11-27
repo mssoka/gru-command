@@ -588,6 +588,13 @@ export interface LessonChangeView {
   readonly previousBody: string | null;
   readonly previousRecurred: number | null;
   readonly previousTags: readonly string[] | null;
+  /** The lesson writer added or changed it (a change the owner may keep or
+   * drop); false when only the chapter cap touched it. Absent from a server
+   * that predates Keep / Drop. */
+  readonly byWriter?: boolean;
+  /** The whole text when the chapter cap cut the lesson (null when not cut);
+   * absent from a server that predates it. */
+  readonly fullBody?: string | null;
 }
 
 /** A lesson the proposal removes, with the text and tags that disappear:
@@ -643,8 +650,13 @@ export interface LessonProposalView {
   /** Gru's one-sentence summary of the update (owner pick 2026-11-26);
    * absent from a pre-summary server, null when none was written. */
   readonly overview?: string | null;
-  /** A decision recorded but not yet finished: only the same one finishes it. */
-  readonly decision: { readonly kind: 'accepted' | 'rejected'; readonly at: string } | null;
+  /** The changes the owner may drop with Keep / Drop, named by the server
+   * (`<chapter>/<lesson>`, or `<chapter>` for a retirement). Absent from a
+   * server that cannot take kept choices: then nothing is offered. */
+  readonly choices?: readonly string[];
+  /** A decision recorded but not yet finished: only the same one finishes
+   * it — for "Save my choices", with the same dropped changes. */
+  readonly decision: { readonly kind: 'accepted' | 'rejected'; readonly at: string; readonly dropped?: readonly string[] } | null;
   /** Why that recorded decision is blocked (the conflict notice explains). */
   readonly recovery: { readonly conflict: string; readonly at: string } | null;
 }
@@ -1034,6 +1046,8 @@ function isLessonChange(value: unknown, added: boolean): boolean {
     typeof value.body === 'string' &&
     isCount(value.recurred) &&
     isStringList(value.tags) &&
+    (value.byWriter === undefined || typeof value.byWriter === 'boolean') &&
+    (value.fullBody === undefined || value.fullBody === null || typeof value.fullBody === 'string') &&
     (added
       ? value.previousBody === null && value.previousRecurred === null && value.previousTags === null
       : typeof value.previousBody === 'string' && isCount(value.previousRecurred) && isStringList(value.previousTags));
@@ -1066,10 +1080,12 @@ export function isValidLessonProposal(value: unknown): value is LessonProposalVi
     isCount(value.entries) &&
     isCount(value.throughSeq) &&
     (value.overview === undefined || value.overview === null || typeof value.overview === 'string') &&
+    (value.choices === undefined || isStringList(value.choices)) &&
     (value.decision === null ||
       (isRecord(value.decision) &&
         (value.decision.kind === 'accepted' || value.decision.kind === 'rejected') &&
-        typeof value.decision.at === 'string')) &&
+        typeof value.decision.at === 'string' &&
+        (value.decision.dropped === undefined || isStringList(value.decision.dropped)))) &&
     (value.recovery === null ||
       (isRecord(value.recovery) && typeof value.recovery.conflict === 'string' && typeof value.recovery.at === 'string')) &&
     Array.isArray(value.chapters) &&

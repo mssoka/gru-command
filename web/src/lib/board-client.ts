@@ -534,8 +534,13 @@ export class BoardClient {
 
   /** The owner's decision on a lesson proposal — the ONLY way it closes
    * (owner decision 2026-10-07); the snapshot then retires the row. */
-  async decideLessonProposal(id: string, decision: 'accept' | 'reject'): Promise<LessonProposalDecisionView> {
-    const { status, body } = await this.postApiWithStatus(`/api/lessons/proposal/${encodeURIComponent(id)}/${decision}`, {});
+  /** Accept all / Reject all — or, with `drop`, "Save my choices": an
+   * Accept that leaves the named changes out (owner request 2026-11-26). */
+  async decideLessonProposal(id: string, decision: 'accept' | 'reject', drop: readonly string[] = []): Promise<LessonProposalDecisionView> {
+    const { status, body } = await this.postApiWithStatus(
+      `/api/lessons/proposal/${encodeURIComponent(id)}/${decision}`,
+      drop.length > 0 ? { drop: [...drop] } : {},
+    );
     const expected = decision === 'accept' ? 'accepted' : 'rejected';
     // C9: a reply counts only when it answers THIS request — this proposal,
     // this choice — in its own phase: 200 finished, 202 recorded but

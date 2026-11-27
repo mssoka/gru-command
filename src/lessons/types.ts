@@ -66,8 +66,11 @@ export class DreamError extends LessonsError {
  * `none` — nothing is pending; `mismatch` — the decision names a different
  * proposal; `stale` — the book or the dream cursor moved since it was
  * proposed (the proposal is withdrawn and the next dream re-proposes);
- * `decided` — the opposite decision was already recorded. */
-export type ProposalErrorCode = 'none' | 'mismatch' | 'stale' | 'decided' | 'conflict' | 'incomplete';
+ * `decided` — the opposite decision (or other kept choices) was already
+ * recorded; `choices` — the kept choices name a change the update cannot
+ * drop; `overflow` — the kept choices would cut or remove something the
+ * owner never saw, so nothing was written (owner request 2026-11-26). */
+export type ProposalErrorCode = 'none' | 'mismatch' | 'stale' | 'decided' | 'conflict' | 'incomplete' | 'choices' | 'overflow';
 
 export class ProposalError extends LessonsError {
   readonly code: ProposalErrorCode;

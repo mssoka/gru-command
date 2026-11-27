@@ -17,6 +17,8 @@ import type {
 import {
   CHANGE_SIZE_LABEL,
   REMOVED_REASON,
+  changeKey,
+  lostTail,
   REWRITE_RATIO,
   changeSize,
   isCutOnly,
@@ -43,6 +45,58 @@ export const LESSON_FILTERS: readonly { readonly id: LessonFilter; readonly labe
   { id: 'removed', label: 'Removed' },
   { id: 'cut', label: '✂ Cut short' },
 ];
+
+/** The owner's Keep / Drop choices in the review (owner request
+ * 2026-11-26): which changes are dropped, whether they may still change,
+ * and how to change one. */
+export interface LessonChoices {
+  /** The changes the server lets the owner drop (the only ones offered). */
+  readonly offered: ReadonlySet<string>;
+  readonly dropped: ReadonlySet<string>;
+  /** Fixed: a decision is in flight or recorded, or the board is stale. */
+  readonly locked: boolean;
+  readonly onChange: (key: string, drop: boolean) => void;
+}
+
+function keepDrop(key: string, name: string, choices: LessonChoices): HTMLElement {
+  const group = el('div', 'board-lessons__keep-drop');
+  group.setAttribute('role', 'group');
+  group.setAttribute('aria-label', `Keep or drop: ${name}`);
+  const dropped = choices.dropped.has(key);
+  const keep = el('button', 'board-lessons__keep-drop-keep', '✓ Keep');
+  keep.type = 'button';
+  keep.dataset.sheetFocus = `keep:${key}`;
+  keep.dataset.changeKey = key;
+  keep.setAttribute('aria-pressed', String(!dropped));
+  const drop = el('button', 'board-lessons__keep-drop-drop', '✕ Drop');
+  drop.type = 'button';
+  drop.dataset.sheetFocus = `drop:${key}`;
+  drop.dataset.changeKey = key;
+  drop.setAttribute('aria-pressed', String(dropped));
+  keep.disabled = choices.locked;
+  drop.disabled = choices.locked;
+  keep.addEventListener('click', () => choices.onChange(key, false));
+  drop.addEventListener('click', () => choices.onChange(key, true));
+  group.append(keep, drop);
+  return group;
+}
+
+/** Why a side effect of the size limit has no Keep / Drop. */
+function forcedNote(): HTMLElement {
+  return el(
+    'div',
+    'board-lessons__forced',
+    'The chapter’s size limit does this, not the lesson writer, so it has no Keep / Drop. ' +
+      'Dropping a new or longer lesson in this chapter makes room.',
+  );
+}
+
+/** A dropped card says what happens instead, and fades. */
+function markDropped(node: HTMLElement, note: string): void {
+  node.classList.add('board-lessons__lesson--dropped');
+  node.dataset.dropped = 'true';
+  node.querySelector('.board-lessons__lesson-head')?.after(el('div', 'board-lessons__dropped-note', note));
+}
 
 /** What briefings do with the book, in one plain sentence. */
 export function lessonStoryText(review: LessonProposalView): string {
@@ -113,6 +167,13 @@ function cutMark(): HTMLElement {
   return el('span', 'board-lessons__cutmark', '✂ cut here to fit');
 }
 
+/** After the cut mark, the text the cut loses — struck, so nothing the cap
+ * takes away is hidden. */
+function appendLost(text: HTMLElement, lesson: LessonChangeView): void {
+  const tail = lostTail(lesson);
+  if (tail !== null) text.append(el('del', 'board-lessons__del board-lessons__lost', tail));
+}
+
 /** One paragraph with the changes marked in place. */
 function markedText(segments: readonly DiffSegment[], cut: boolean): HTMLElement {
   const text = el('p', 'board-lessons__text');
@@ -177,7 +238,7 @@ function lessonHead(badges: readonly [string, string][], name: string): HTMLElem
   return head;
 }
 
-function newLesson(lesson: LessonChangeView): HTMLElement {
+function newLesson(lesson: LessonChangeView, chapterSlug: string, choices?: LessonChoices): HTMLElement {
   const { text, cut } = splitCut(lesson.body);
   const node = el('article', `board-lessons__lesson board-lessons__lesson--new${cut ? ' board-lessons__lesson--cut' : ''}`);
   node.dataset.lessonKind = 'new';
@@ -188,13 +249,19 @@ function newLesson(lesson: LessonChangeView): HTMLElement {
   );
   const body = el('p', 'board-lessons__text', text);
   if (cut) body.append(cutMark());
+  appendLost(body, lesson);
   node.append(body);
   const labels = plainLabels(lesson.tags);
   if (labels !== null) node.append(labels);
+  if (choices !== undefined && choices.offered.has(changeKey(chapterSlug, lesson.slug))) {
+    const key = changeKey(chapterSlug, lesson.slug);
+    node.querySelector('.board-lessons__lesson-head')!.append(keepDrop(key, lessonName(lesson.slug), choices));
+    if (choices.dropped.has(key)) markDropped(node, 'Dropped: this lesson will not be added.');
+  }
   return node;
 }
 
-function changedLesson(lesson: LessonChangeView): HTMLElement {
+function changedLesson(lesson: LessonChangeView, chapterSlug: string, choices?: LessonChoices): HTMLElement {
   const diff = lessonDiff(lesson);
   const reworded = diff.segments.some((segment) => segment.kind === 'change');
   const previous = lesson.previousRecurred;
@@ -228,15 +295,31 @@ function changedLesson(lesson: LessonChangeView): HTMLElement {
     }
   }
   node.append(why);
-  node.append(!diff.cutOnly && diff.ratio >= REWRITE_RATIO ? beforeAfter(diff.segments, diff.cut) : markedText(diff.segments, diff.cut));
+  const shown = !diff.cutOnly && diff.ratio >= REWRITE_RATIO ? beforeAfter(diff.segments, diff.cut) : markedText(diff.segments, diff.cut);
+  if (!diff.cutOnly) {
+    const after = shown.classList.contains('board-lessons__pair') ? shown.querySelectorAll('.board-lessons__text')[1] : shown;
+    if (after instanceof HTMLElement) appendLost(after, lesson);
+  }
+  node.append(shown);
   if (lesson.previousTags !== null) {
     const labels = labelsLine(lesson.previousTags, lesson.tags);
     if (labels !== null) node.append(labels);
   }
+  if (choices !== undefined) {
+    if (choices.offered.has(changeKey(chapterSlug, lesson.slug))) {
+      const key = changeKey(chapterSlug, lesson.slug);
+      node.querySelector('.board-lessons__lesson-head')!.append(keepDrop(key, lessonName(lesson.slug), choices));
+      if (choices.dropped.has(key)) {
+        markDropped(node, reworded ? 'Dropped: the lesson keeps its old wording.' : 'Dropped: the lesson stays as it was.');
+      }
+    } else if (diff.cutOnly) {
+      node.append(forcedNote());
+    }
+  }
   return node;
 }
 
-function removedLesson(lesson: RemovedLessonView): HTMLElement {
+function removedLesson(lesson: RemovedLessonView, choices?: LessonChoices): HTMLElement {
   const node = el('article', `board-lessons__lesson board-lessons__lesson--removed`);
   node.dataset.lessonKind = 'removed';
   node.dataset.cut = 'false';
@@ -247,6 +330,8 @@ function removedLesson(lesson: RemovedLessonView): HTMLElement {
   );
   const labels = plainLabels(lesson.tags, true);
   if (labels !== null) node.append(labels);
+  // A retirement is decided on its chapter; a cap removal is a side effect.
+  if (choices !== undefined && lesson.reason !== 'retired') node.append(forcedNote());
   return node;
 }
 
@@ -302,11 +387,16 @@ function tocLines(entry: LessonIndexChangeView, chapter?: LessonChapterChangeVie
   return lines;
 }
 
-function chapterHead(chapter: LessonChapterChangeView, toc: LessonIndexChangeView | undefined): HTMLElement {
+function chapterHead(chapter: LessonChapterChangeView, toc: LessonIndexChangeView | undefined, choices?: LessonChoices): HTMLElement {
   const head = el('div', 'board-lessons__chapter-head');
   const title = el('div', 'board-lessons__chapter-title');
   title.append(el('h3', 'board-lessons__chapter-name', chapter.title.after));
   if (chapter.retired) title.append(el('span', 'board-lessons__badge board-lessons__badge--removed', 'Chapter removed'));
+  if (chapter.retired && choices !== undefined && choices.offered.has(changeKey(chapter.slug))) {
+    const key = changeKey(chapter.slug);
+    title.append(keepDrop(key, `remove the chapter ${chapter.title.after}`, choices));
+    if (choices.dropped.has(key)) head.dataset.dropped = 'true';
+  }
   else if (chapter.title.before === null) title.append(el('span', 'board-lessons__badge board-lessons__badge--new', 'New chapter'));
   else if (chapter.title.before !== chapter.title.after) title.append(el('span', 'board-lessons__badge board-lessons__badge--chapter', 'Renamed'));
   head.append(title);
@@ -325,6 +415,7 @@ function chapterHead(chapter: LessonChapterChangeView, toc: LessonIndexChangeVie
     if (tags !== null) head.append(tags);
   }
   if (toc !== undefined) head.append(...tocLines(toc, chapter));
+  if (head.dataset.dropped === 'true') head.append(el('div', 'board-lessons__dropped-note', 'Dropped: the chapter stays in the book, with all its lessons.'));
   return head;
 }
 
@@ -338,7 +429,7 @@ function visible(node: HTMLElement, filter: LessonFilter): boolean {
  * table-of-contents lines of chapters with no lesson change, then the
  * housekeeping footnote. A filter narrows the lessons shown; the chapter
  * and table-of-contents changes show under "All". */
-export function lessonChanges(review: LessonProposalView, filter: LessonFilter): HTMLElement {
+export function lessonChanges(review: LessonProposalView, filter: LessonFilter, choices?: LessonChoices): HTMLElement {
   const root = el('div', 'board-lessons__changes');
   const toc = new Map(review.index.map((entry) => [entry.slug, entry]));
   let shownLessons = 0;
@@ -346,16 +437,16 @@ export function lessonChanges(review: LessonProposalView, filter: LessonFilter):
   for (const chapter of review.chapters) {
     sourcesDropped += chapter.provenanceTrimmed;
     const lessons = [
-      ...chapter.added.map(newLesson),
-      ...chapter.changed.map(changedLesson),
-      ...chapter.removed.map(removedLesson),
+      ...chapter.added.map((lesson) => newLesson(lesson, chapter.slug, choices)),
+      ...chapter.changed.map((lesson) => changedLesson(lesson, chapter.slug, choices)),
+      ...chapter.removed.map((lesson) => removedLesson(lesson, choices)),
     ].filter((node) => visible(node, filter));
     const entry = toc.get(chapter.slug);
     toc.delete(chapter.slug);
     if (filter !== 'all' && lessons.length === 0) continue;
     const section = el('section', 'board-lessons__chapter');
     section.dataset.chapter = chapter.slug;
-    section.append(chapterHead(chapter, entry), ...lessons);
+    section.append(chapterHead(chapter, entry, choices), ...lessons);
     if (filter === 'all' && lessons.length === 0) section.append(el('div', 'board-lessons__quiet', 'No lesson in this chapter changes.'));
     shownLessons += lessons.length;
     root.append(section);

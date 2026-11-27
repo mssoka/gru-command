@@ -184,6 +184,15 @@ export interface LessonChangeView {
   readonly previousBody: string | null;
   readonly previousRecurred: number | null;
   readonly previousTags: readonly string[] | null;
+  /** True when the lesson writer added or changed this lesson — a change
+   * the owner may keep or drop (owner request 2026-11-26). False when only
+   * the chapter cap touched it (a cut, or the cap's archive record): a side
+   * effect, not a choice. */
+  readonly byWriter: boolean;
+  /** The lesson's whole text when the chapter cap cut it (its body ends
+   * with the trim marker) — what is lost is shown, never hidden; null when
+   * the lesson is not cut. */
+  readonly fullBody: string | null;
 }
 
 /** A lesson the update removes, with the text and tags that disappear:
@@ -644,8 +653,6 @@ export class BibleStore {
     const retired = new Set<string>();
     let lessonsAdded = 0;
     let lessonsMerged = 0;
-    let lessonsTrimmed = 0;
-    let lessonsDropped = 0;
 
     for (const proposed of updates) {
       // Canonical first — what the chapter format will read back — then
@@ -670,61 +677,12 @@ export class BibleStore {
       touched.add(update.slug);
     }
 
-    const finalChapters: BibleChapter[] = [];
-    const writes: { slug: string; text: string; uncapped: BibleChapter }[] = [];
-    for (const chapter of chapters.values()) {
-      if (!touched.has(chapter.slug)) {
-        finalChapters.push(chapter);
-        continue;
-      }
-      if (retired.has(chapter.slug)) continue;
-      const capped = enforceChapterCap(chapter, this.chapterCapBytes);
-      assertReadsBack(capped.text, capped.chapter);
-      lessonsTrimmed += capped.trimmed;
-      lessonsDropped += capped.droppedLessons;
-      finalChapters.push(capped.chapter);
-      writes.push({ slug: chapter.slug, text: capped.text, uncapped: chapter });
-    }
-    // Render the index BEFORE any write: a cap failure must leave the whole
-    // bible untouched (otherwise a retried dream could double-count
-    // recurrences over half-applied state).
-    const indexText = renderIndex(finalChapters, this.indexCapBytes);
-
-    const after = new Map(files);
-    for (const write of writes) after.set(`${BIBLE_CHAPTERS_DIR}/${write.slug}.md`, write.text);
-    for (const slug of retired) after.delete(`${BIBLE_CHAPTERS_DIR}/${slug}.md`);
-    after.set(BIBLE_INDEX_FILE, indexText);
-    const touchedPaths = [
-      ...writes.map((write) => `${BIBLE_CHAPTERS_DIR}/${write.slug}.md`),
-      ...[...retired].map((slug) => `${BIBLE_CHAPTERS_DIR}/${slug}.md`),
-      BIBLE_INDEX_FILE,
-    ];
-
-    const baselinePaths = [...new Set([...files.keys(), ...touchedPaths])].sort();
-    return {
-      base: bookFingerprint(files),
-      after: bookFingerprint(after),
-      files: touchedPaths.map((path) => ({
-        path,
-        before: contentHash(files.get(path)),
-        after: contentHash(after.get(path)),
-      })),
-      before: baselinePaths.map((path) => ({ path, text: files.get(path) ?? null })),
-      writes,
-      retired: [...retired],
-      indexText,
+    return assemblePlan(files, chapters, touched, retired, {
       chapterCapBytes: this.chapterCapBytes,
       indexCapBytes: this.indexCapBytes,
-      contract: PLAN_CONTRACT,
-      report: {
-        chaptersWritten: writes.length,
-        chaptersRetired: retired.size,
-        lessonsAdded,
-        lessonsMerged,
-        lessonsTrimmed,
-        lessonsDropped,
-      },
-    };
+      lessonsAdded,
+      lessonsMerged,
+    });
   }
 
   /**
@@ -1033,6 +991,287 @@ export function describePlan(plan: BiblePlan): PlanReview {
   return { chapters, index };
 }
 
+/** The second half of planning, shared by a dream pass and by the owner's
+ * kept choices: cap every touched chapter, render the index BEFORE any
+ * write (a cap failure must leave the whole bible untouched), and record
+ * each touched file's before/after hash and the complete baseline. */
+function assemblePlan(
+  files: ReadonlyMap<string, string>,
+  chapters: ReadonlyMap<string, BibleChapter>,
+  touched: ReadonlySet<string>,
+  retired: ReadonlySet<string>,
+  input: { readonly chapterCapBytes: number; readonly indexCapBytes: number; readonly lessonsAdded: number; readonly lessonsMerged: number },
+): BiblePlan {
+  let lessonsTrimmed = 0;
+  let lessonsDropped = 0;
+  const finalChapters: BibleChapter[] = [];
+  const writes: { slug: string; text: string; uncapped: BibleChapter }[] = [];
+  for (const chapter of chapters.values()) {
+    if (!touched.has(chapter.slug)) {
+      finalChapters.push(chapter);
+      continue;
+    }
+    if (retired.has(chapter.slug)) continue;
+    const capped = enforceChapterCap(chapter, input.chapterCapBytes);
+    assertReadsBack(capped.text, capped.chapter);
+    lessonsTrimmed += capped.trimmed;
+    lessonsDropped += capped.droppedLessons;
+    finalChapters.push(capped.chapter);
+    writes.push({ slug: chapter.slug, text: capped.text, uncapped: chapter });
+  }
+  // Render the index BEFORE any write: a cap failure must leave the whole
+  // bible untouched (otherwise a retried dream could double-count
+  // recurrences over half-applied state).
+  const indexText = renderIndex(finalChapters, input.indexCapBytes);
+
+  const after = new Map(files);
+  for (const write of writes) after.set(`${BIBLE_CHAPTERS_DIR}/${write.slug}.md`, write.text);
+  for (const slug of retired) after.delete(`${BIBLE_CHAPTERS_DIR}/${slug}.md`);
+  after.set(BIBLE_INDEX_FILE, indexText);
+  const touchedPaths = [
+    ...writes.map((write) => `${BIBLE_CHAPTERS_DIR}/${write.slug}.md`),
+    ...[...retired].map((slug) => `${BIBLE_CHAPTERS_DIR}/${slug}.md`),
+    BIBLE_INDEX_FILE,
+  ];
+
+  const baselinePaths = [...new Set([...files.keys(), ...touchedPaths])].sort();
+  return {
+    base: bookFingerprint(files),
+    after: bookFingerprint(after),
+    files: touchedPaths.map((path) => ({
+      path,
+      before: contentHash(files.get(path)),
+      after: contentHash(after.get(path)),
+    })),
+    before: baselinePaths.map((path) => ({ path, text: files.get(path) ?? null })),
+    writes,
+    retired: [...retired],
+    indexText,
+    chapterCapBytes: input.chapterCapBytes,
+    indexCapBytes: input.indexCapBytes,
+    contract: PLAN_CONTRACT,
+    report: {
+      chaptersWritten: writes.length,
+      chaptersRetired: retired.size,
+      lessonsAdded: input.lessonsAdded,
+      lessonsMerged: input.lessonsMerged,
+      lessonsTrimmed,
+      lessonsDropped,
+    },
+  };
+}
+
+/** Same lesson as far as the book is concerned: text, recurrence, tags and
+ * provenance. */
+function sameLesson(left: BibleLesson, right: BibleLesson): boolean {
+  return left.body === right.body && left.recurred === right.recurred &&
+    left.tags.join('\u0000') === right.tags.join('\u0000') &&
+    JSON.stringify(left.provenance) === JSON.stringify(right.provenance);
+}
+
+/** The chapters a plan was computed against, read from its own baseline. */
+function baselineChapters(plan: BiblePlan): Map<string, BibleChapter> {
+  const chapters = new Map<string, BibleChapter>();
+  for (const entry of plan.before) {
+    if (entry.text === null || !entry.path.startsWith(`${BIBLE_CHAPTERS_DIR}/`) || !entry.path.endsWith('.md')) continue;
+    const slug = entry.path.slice(BIBLE_CHAPTERS_DIR.length + 1, -'.md'.length);
+    chapters.set(slug, parseChapter(entry.text, slug, planContract(plan)));
+  }
+  return chapters;
+}
+
+/**
+ * The changes in a plan the owner may drop (owner request 2026-11-26): a
+ * lesson the writer added or changed (`<chapter>/<lesson>`) and a chapter
+ * the writer retires (`<chapter>`). Cap effects — cuts, cap removals, the
+ * archive record — are side effects, never choices.
+ */
+export function planChoices(plan: BiblePlan): ReadonlySet<string> {
+  const original = baselineChapters(plan);
+  const keys = new Set<string>();
+  for (const write of plan.writes) {
+    const prior = new Map((original.get(write.slug)?.lessons ?? []).map((lesson) => [lesson.slug, lesson]));
+    for (const lesson of write.uncapped.lessons) {
+      const before = prior.get(lesson.slug);
+      if (before === undefined || !sameLesson(before, lesson)) keys.add(`${write.slug}/${lesson.slug}`);
+    }
+  }
+  for (const slug of plan.retired) keys.add(slug);
+  return keys;
+}
+
+/**
+ * The plan the owner's kept choices make: the same baseline, with each
+ * dropped change undone before the cap runs again — a dropped new lesson is
+ * left out, a dropped update keeps the lesson as it was, a dropped
+ * retirement keeps the chapter. A chapter whose every change is dropped is
+ * left exactly as it is (a new one is not created). Only a plan made under
+ * today's planning contract can be re-planned; an unknown key fails loud.
+ */
+export function replanWithout(plan: BiblePlan, drop: ReadonlySet<string>): BiblePlan {
+  verifyPlan(plan);
+  if (planContract(plan) !== PLAN_CONTRACT) {
+    throw new BibleError('this update was planned by an older release: it can only be accepted or rejected whole');
+  }
+  const choices = planChoices(plan);
+  for (const key of drop) {
+    if (!choices.has(key)) throw new BibleError(`"${key}" is not a change in this update that can be dropped`);
+  }
+  const files = new Map(
+    plan.before.filter((entry): entry is { path: string; text: string } => entry.text !== null).map((entry) => [entry.path, entry.text]),
+  );
+  const original = baselineChapters(plan);
+  const chapters = new Map(original);
+  const touched = new Set<string>();
+  const retired = new Set(plan.retired.filter((slug) => !drop.has(slug)));
+  let lessonsAdded = 0;
+  let lessonsMerged = 0;
+  for (const write of plan.writes) {
+    const prior = original.get(write.slug) ?? null;
+    const priorLessons = new Map((prior?.lessons ?? []).map((lesson) => [lesson.slug, lesson]));
+    let offered = 0;
+    let kept = 0;
+    const lessons: BibleLesson[] = [];
+    for (const lesson of write.uncapped.lessons) {
+      const before = priorLessons.get(lesson.slug);
+      const change = before === undefined || !sameLesson(before, lesson);
+      if (!change) {
+        lessons.push(lesson);
+        continue;
+      }
+      offered += 1;
+      if (!drop.has(`${write.slug}/${lesson.slug}`)) {
+        kept += 1;
+        if (before === undefined) lessonsAdded += 1;
+        else lessonsMerged += 1;
+        lessons.push(lesson);
+      } else if (before !== undefined) {
+        lessons.push(before); // dropped update: the lesson stays as it was
+      }
+      // dropped new lesson: left out
+    }
+    // Every lesson change dropped: a new chapter is not created; an existing
+    // one keeps its lessons as they were — and still takes its rename,
+    // description and labels (shown with no Keep / Drop of their own), or is
+    // left exactly as it is when it has none. A chapter with nothing to
+    // choose keeps its update.
+    if (offered > 0 && kept === 0) {
+      if (prior === null) continue;
+      const metadataChanged = prior.title !== write.uncapped.title || prior.summary !== write.uncapped.summary ||
+        prior.tags.join('\u0000') !== write.uncapped.tags.join('\u0000');
+      if (!metadataChanged) continue;
+    }
+    chapters.set(write.slug, { ...write.uncapped, lessons });
+    touched.add(write.slug);
+  }
+  for (const slug of retired) chapters.delete(slug);
+  return assemblePlan(files, chapters, touched, retired, {
+    chapterCapBytes: plan.chapterCapBytes,
+    indexCapBytes: plan.indexCapBytes,
+    lessonsAdded,
+    lessonsMerged,
+  });
+}
+
+/** A slug as the owner reads it ("shell-hang" → "Shell hang"). */
+function plainSlug(slug: string): string {
+  const words = slug.replace(/-+/gu, ' ').trim();
+  return words.charAt(0).toUpperCase() + words.slice(1);
+}
+
+/**
+ * The lesson text a re-planned update would write or lose beyond what the
+ * reviewed update showed: a lesson cut where it was whole (or cut shorter
+ * than shown), text written that was never on screen, a lesson removed or
+ * left out. A lesson the review showed cut may come back longer, up to the
+ * whole text it showed struck; one the review showed removed may come back,
+ * whole or cut, within the text it showed.
+ */
+export function unseenLessonLosses(reviewed: PlanReview, revised: PlanReview): string[] {
+  const shown = new Map<string, { readonly body: string; readonly whole: string }>();
+  const gone = new Map<string, string>();
+  for (const chapter of reviewed.chapters) {
+    for (const lesson of [...chapter.added, ...chapter.changed]) {
+      shown.set(`${chapter.slug}/${lesson.slug}`, { body: lesson.body, whole: lesson.fullBody ?? untrimmed(lesson.body) });
+    }
+    for (const lesson of chapter.removed) gone.set(`${chapter.slug}/${lesson.slug}`, lesson.body);
+  }
+  const losses: string[] = [];
+  for (const chapter of revised.chapters) {
+    for (const lesson of [...chapter.added, ...chapter.changed]) {
+      const key = `${chapter.slug}/${lesson.slug}`;
+      const text = untrimmed(lesson.body).trimEnd();
+      const cut = lesson.body.endsWith(TRIM_MARKER);
+      const before = shown.get(key);
+      const removedText = gone.get(key);
+      // The text written must have been on screen: within the whole text
+      // the review showed (struck tail included), or a removed card's text.
+      const onScreen = (before !== undefined && before.whole.startsWith(text)) ||
+        (removedText !== undefined && removedText.startsWith(text));
+      if (!onScreen) {
+        losses.push(`“${plainSlug(lesson.slug)}” in “${chapter.title.after}” would ${cut ? 'be cut short' : 'read differently from the review'}`);
+        continue;
+      }
+      // A cut must go no further than the one shown (a removed lesson coming
+      // back cut is more than the review promised, never less).
+      if (cut && before !== undefined && removedText === undefined) {
+        const shownCut = before.body.endsWith(TRIM_MARKER) ? untrimmed(before.body).trimEnd() : null;
+        if (shownCut === null || !text.startsWith(shownCut)) losses.push(`“${plainSlug(lesson.slug)}” in “${chapter.title.after}” would be cut short`);
+      }
+    }
+    for (const lesson of chapter.removed) {
+      if (lesson.reason === 'retired' || gone.has(`${chapter.slug}/${lesson.slug}`)) continue;
+      losses.push(`“${plainSlug(lesson.slug)}” in “${chapter.title.after}” would be ${lesson.reason === 'discarded' ? 'left out' : 'removed'}`);
+    }
+  }
+  return losses;
+}
+
+/** How the INDEX shows each chapter of the book a plan produces: whether
+ * its labels were dropped to fit and how its line was cut. */
+function indexCompaction(plan: BiblePlan): Map<string, { readonly tagsDropped: boolean; readonly cut: string | null }> {
+  const { result } = verifyPlan(plan);
+  const contract = planContract(plan);
+  const out = new Map<string, { readonly tagsDropped: boolean; readonly cut: string | null }>();
+  for (const entry of parseIndex(plan.indexText, contract)) {
+    const text = result.get(`${BIBLE_CHAPTERS_DIR}/${entry.slug}.md`);
+    if (text === undefined) continue;
+    const chapter = parseChapter(text, entry.slug, contract);
+    const whole = collapseLine(chapter.summary);
+    out.set(entry.slug, {
+      tagsDropped: entry.tags.length < chapter.tags.length,
+      cut: entry.summary === whole ? null : entry.summary.replace(/…$/u, '').trimEnd(),
+    });
+  }
+  return out;
+}
+
+/**
+ * What a re-planned update would lose that the owner never saw in the
+ * review they decided on — lesson text (unseenLessonLosses), a
+ * table-of-contents line that loses its labels or is cut shorter, and more
+ * old source notes released to fit — in plain words. Empty when every
+ * loss was already on screen.
+ */
+export function unseenLosses(reviewedPlan: BiblePlan, revisedPlan: BiblePlan): string[] {
+  const reviewed = describePlan(reviewedPlan);
+  const revised = describePlan(revisedPlan);
+  const losses = unseenLessonLosses(reviewed, revised);
+  const before = indexCompaction(reviewedPlan);
+  for (const [slug, now] of indexCompaction(revisedPlan)) {
+    const shown = before.get(slug);
+    if (now.tagsDropped && shown?.tagsDropped !== true) losses.push(`the table of contents would lose the labels of “${plainSlug(slug)}”`);
+    if (now.cut !== null && (shown?.cut == null || !now.cut.startsWith(shown.cut))) {
+      losses.push(`the table-of-contents line of “${plainSlug(slug)}” would be cut short`);
+    }
+  }
+  const released = (review: PlanReview): number => review.chapters.reduce((sum, chapter) => sum + chapter.provenanceTrimmed, 0);
+  if (released(revised) > released(reviewed)) {
+    losses.push(`${released(revised)} old source notes would be dropped to fit, not the ${released(reviewed)} shown`);
+  }
+  return losses;
+}
+
 /** sha256 of one file's content; null when the file is absent. */
 function contentHash(text: string | undefined | null): string | null {
   return text === undefined || text === null ? null : createHash('sha256').update(text, 'utf8').digest('hex');
@@ -1062,12 +1301,14 @@ function describeChapterChange(before: BibleChapter | null, uncapped: BibleChapt
   // lesson (C5): its arrival, any change to its text or tags, and its
   // removal are all visible — only handle-only changes stay summarized.
   const previous = new Map((before?.lessons ?? []).map((lesson) => [lesson.slug, lesson]));
+  const merged = new Map(uncapped.lessons.map((lesson) => [lesson.slug, lesson]));
   const added: LessonChangeView[] = [];
   const changed: LessonChangeView[] = [];
   const kept = new Set<string>();
   for (const lesson of after.lessons) {
     kept.add(lesson.slug);
     const prior = previous.get(lesson.slug);
+    const incoming = merged.get(lesson.slug);
     const view = {
       slug: lesson.slug,
       body: lesson.body,
@@ -1076,6 +1317,8 @@ function describeChapterChange(before: BibleChapter | null, uncapped: BibleChapt
       previousBody: prior?.body ?? null,
       previousRecurred: prior?.recurred ?? null,
       previousTags: prior?.tags ?? null,
+      byWriter: incoming !== undefined && (prior === undefined || !sameLesson(prior, incoming)),
+      fullBody: lesson.body.endsWith(TRIM_MARKER) ? untrimmed(incoming?.body ?? prior?.body ?? lesson.body) : null,
     };
     if (prior === undefined) added.push(view);
     else if (prior.body !== lesson.body || prior.recurred !== lesson.recurred || prior.tags.join('\u0000') !== lesson.tags.join('\u0000')) {
