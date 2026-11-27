@@ -72,7 +72,9 @@ what changes** opens the full review: every chapter and lesson the Accept
 would write, each reworded lesson with its changes marked word by word
 (in place for an edit, before and after side by side for a rewrite).
 **Accept all** writes the update; **Reject all** keeps the book as it is
-and consumes the batch.
+and consumes the batch. Bob also writes a one-sentence `overview` for the
+owner in the same pass (no extra model call); the card and the review
+show it as Gru speaking.
 
 ### 3. Bible (format)
 

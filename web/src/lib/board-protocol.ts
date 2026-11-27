@@ -640,6 +640,9 @@ export interface LessonProposalView {
   readonly throughSeq: number;
   readonly chapters: readonly LessonChapterChangeView[];
   readonly index: readonly LessonIndexChangeView[];
+  /** Gru's one-sentence summary of the update (owner pick 2026-11-26);
+   * absent from a pre-summary server, null when none was written. */
+  readonly overview?: string | null;
   /** A decision recorded but not yet finished: only the same one finishes it. */
   readonly decision: { readonly kind: 'accepted' | 'rejected'; readonly at: string } | null;
   /** Why that recorded decision is blocked (the conflict notice explains). */
@@ -1062,6 +1065,7 @@ export function isValidLessonProposal(value: unknown): value is LessonProposalVi
     typeof value.notificationId === 'string' &&
     isCount(value.entries) &&
     isCount(value.throughSeq) &&
+    (value.overview === undefined || value.overview === null || typeof value.overview === 'string') &&
     (value.decision === null ||
       (isRecord(value.decision) &&
         (value.decision.kind === 'accepted' || value.decision.kind === 'rejected') &&

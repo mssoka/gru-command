@@ -155,6 +155,7 @@ import {
   filterCounts,
   lessonChanges,
   lessonChecks,
+  lessonOverview,
   lessonStoryText,
   lessonTally,
   type LessonFilter,
@@ -1183,6 +1184,8 @@ export class BoardView {
       if (current.loading !== null) story.append(el('div', 'board-lessons__quiet', 'Reading the changes…'));
       else if (current.loadFailed) story.append(el('div', 'board-lessons__quiet', 'The changes could not be read yet: “See what changes” tries again.'));
     } else {
+      const overview = lessonOverview(review);
+      if (overview !== null) story.append(overview);
       story.append(el('div', 'board-owner__context board-lessons__context', lessonStoryText(review)), lessonTally(analysis), lessonChecks(analysis));
     }
     const call = el('div', 'board-lessons__call');
@@ -1380,6 +1383,8 @@ export class BoardView {
         body.append(retry);
       }
     } else {
+      const overview = lessonOverview(review);
+      if (overview !== null) top.append(overview);
       top.append(lessonTally(analysis));
       const counts = filterCounts(review);
       const filters = el('div', 'board-lessons-sheet__filters');

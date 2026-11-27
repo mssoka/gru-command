@@ -27,7 +27,7 @@ import {
   type DreamOutcome,
   type ProposalNotifier,
 } from '../src/lessons/dream.js';
-import { DREAM_PROMPT_BODY_CLAMP, parseDreamOutput, renderDreamPrompt } from '../src/lessons/distiller.js';
+import { DREAM_PROMPT_BODY_CLAMP, OVERVIEW_MAX_CHARS, OVERVIEW_PROMPT_CHARS, parseDreamOutput, renderDreamPrompt } from '../src/lessons/distiller.js';
 import { JournalStore } from '../src/lessons/journal.js';
 import { DreamError, type JournalEntry, type ProposedChapter } from '../src/lessons/types.js';
 
@@ -280,6 +280,35 @@ describe('dream distiller protocol (one Bob pass)', () => {
         entries,
       ),
     ).toThrowError(/kebab-case slug/);
+  });
+
+  it('asks for and parses the owner overview: one line, cut with a visible ellipsis when long, absent, null or blank is none, a non-string is malformed', () => {
+    const entries = [entry('j-1', 'finding')];
+    const prompt = renderDreamPrompt({
+      entries,
+      index: null,
+      bibleDir: '/tmp/bible',
+      chapterCapBytes: 4096,
+      indexCapBytes: 1024,
+      outputFile: '/tmp/bible/.dream-output-abc.json',
+    });
+    expect(prompt).toContain('also write "overview": ONE plain-English sentence for the');
+    expect(prompt).toContain(`owner (at most ${OVERVIEW_PROMPT_CHARS} characters)`);
+    expect(prompt).toContain('{"overview":"one plain sentence for the owner",');
+    const chapters = [{ slug: 'ops', title: 'Ops', summary: 'x', lessons: [{ slug: 'y', body: 'b', journalIds: ['j-1'] }] }];
+    const parse = (overview: unknown) => parseDreamOutput(JSON.stringify({ overview, chapters }), entries);
+    expect(parse('  Restart only after\n the shell   closes. ').overview).toBe('Restart only after the shell closes.');
+    expect(parseDreamOutput(JSON.stringify({ chapters }), entries)).not.toHaveProperty('overview');
+    const long = parse(`${'word '.repeat(80)}end`).overview!;
+    expect(long.length).toBeLessThanOrEqual(OVERVIEW_MAX_CHARS);
+    expect(long.endsWith('word…')).toBe(true);
+    // Nothing to say never fails the whole pass.
+    for (const none of [null, '', '   \n ']) expect(parse(none), JSON.stringify(none)).not.toHaveProperty('overview');
+    for (const bad of [42, ['a'], { text: 'x' }]) expect(() => parse(bad), JSON.stringify(bad)).toThrowError(/dream output overview must be a string/);
+    // A cut never splits an emoji (a surrogate pair) in half.
+    const emoji = parse(`${'x'.repeat(OVERVIEW_MAX_CHARS - 2)}😀 and more words after it`).overview!;
+    expect(emoji.endsWith('\ud83d…')).toBe(false);
+    expect(Buffer.from(emoji, 'utf8').toString('utf8')).toBe(emoji);
   });
 
   it('accepts a retire update without a lessons array', () => {
@@ -1351,6 +1380,27 @@ describe('owner-approved lesson proposals (owner decision 2026-10-07)', () => {
     const write = (record['plan'] as { writes: { text: string }[] }).writes[0]!;
     const review = h.proposals.review()!;
     expect(write.text).toContain(review.chapters[0]!.added[0]!.body);
+  });
+
+  it('the distiller overview is stored with the proposal and shown in its review; a record without one reads as none, a non-string one is malformed', async () => {
+    const h = proposalHarness((input) => ({ chapters: [updateFrom(input.entries)], overview: 'Restart only after the shell closes.' }));
+    h.journal.append({ kind: 'finding', source: 'gru', body: 'shell hang finding' });
+    await h.engine.run();
+    expect(h.stored()['overview']).toBe('Restart only after the shell closes.');
+    expect(h.proposals.review()!.overview).toBe('Restart only after the shell closes.');
+    // A record written before overviews existed carries no field: none.
+    const { overview: _dropped, ...older } = h.stored();
+    h.store(older);
+    expect(h.proposals.review()!.overview).toBeNull();
+    // Integrity is checked before anything is shown.
+    h.store({ ...older, overview: 7 });
+    expect(() => h.proposals.review()).toThrowError(/is malformed \(overview\)/);
+    // A distiller that writes none proposes with none.
+    const plain = proposalHarness();
+    plain.journal.append({ kind: 'finding', source: 'gru', body: 'shell hang finding' });
+    await plain.engine.run();
+    expect(plain.stored()['overview']).toBeNull();
+    expect(plain.proposals.review()!.overview).toBeNull();
   });
 
   it('a bounded replay keeps its tail: two replayed entries, one per pass, Accept then Reject, cursor never rewinds', async () => {
